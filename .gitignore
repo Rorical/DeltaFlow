@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.egg-info/
+
+# virtual environments
+.venv/
+env/
+venv/
+
+# pyright / mypy
+.mypy_cache/
+.pyright/
+
+# pyenv/uv
+.python-version
+uv.lock
+
+# pytest
+.pytest_cache/
+
+# lightning logs and checkpoints
+lightning_logs/
+*.ckpt
+
+# datasets cache
+datasets/
+cache/
