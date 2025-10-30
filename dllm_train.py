@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -165,7 +166,24 @@ class DiffusionLLMModule(pl.LightningModule):
         self.tokenizer: Optional[AutoTokenizer] = None
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=0.01, betas=(0.9, 0.95))
+
+        # Scheduler with warmup + cosine decay
+        # Use Lightning's estimate of total training steps
+        total_steps = max(1, getattr(self.trainer, "estimated_stepping_batches", 0))
+        warmup_steps = max(100, int(0.02 * total_steps))
+        warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+        cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
+        scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     def _sample_timesteps(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
         return torch.rand(batch_size, seq_len, device=device)
@@ -262,7 +280,6 @@ class DiffusionLLMModule(pl.LightningModule):
                 target_logits.shape, device=loss.device, dtype=target_logits.dtype
             )
             state_logits = (1.0 - t.unsqueeze(-1)) * init_logits + t.unsqueeze(-1) * target_logits
-            state_logits = self.model.state_norm(state_logits)
             delta = (1.0 - t).unsqueeze(-1)
 
             velocity = self.model.predict_velocity(state_logits, timesteps=t.unsqueeze(-1), padding_mask=attention_mask)
@@ -283,7 +300,7 @@ class DiffusionLLMModule(pl.LightningModule):
         *,
         steps: int = 10,
         prompt: Optional[str] = None,
-        sampler: str = "huen",
+        sampler: str = "heun",
     ) -> str:
         self.eval()
         device = next(self.parameters()).device
@@ -325,15 +342,24 @@ class DiffusionLLMModule(pl.LightningModule):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DLLM on WikiText using PyTorch Lightning")
     parser.add_argument("--epochs", type=int, default=1)
+    # Model size convenience preset; overrides dims if provided
+    parser.add_argument("--model-size", type=str, default=None, choices=["small", "base", "large"], help="Preset model size.")
     parser.add_argument("--embed-dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--ff-hidden-dim", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=100, help="Sampling steps during evaluation.")
+    # Data variant selection
+    parser.add_argument("--dataset-name", type=str, default="wikitext")
+    parser.add_argument("--dataset-config", type=str, default="wikitext-2-raw-v1", help="e.g., wikitext-103-raw-v1")
+    # Trainer/runtime
+    parser.add_argument("--precision", type=str, default="bf16-mixed", choices=["32-true", "16-mixed", "bf16-mixed"], help="Mixed precision for memory/perf.")
+    parser.add_argument("--accumulate-grad-batches", type=int, default=1)
+    # Evaluation sampling
+    parser.add_argument("--steps", type=int, default=2000, help="Sampling steps during evaluation.")
     parser.add_argument("--prompt", type=str, default="Once upon", help="Prompt text for conditional sampling.")
     parser.add_argument("--sample-interval", type=int, default=0, help="Training sample interval in steps (0 to disable).")
     parser.add_argument("--sample-seq-len", type=int, default=64, help="Sequence length for periodic training samples.")
@@ -345,11 +371,26 @@ def main() -> None:
     args = parse_args()
 
     pl.seed_everything(42, workers=True)
-    data_cfg = DataConfig(batch_size=args.batch_size, block_size=args.block_size, num_workers=args.num_workers)
+    data_cfg = DataConfig(
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        batch_size=args.batch_size,
+        block_size=args.block_size,
+        num_workers=args.num_workers,
+    )
     data_module = WikiTextDataModule(data_cfg)
     data_module.setup()
 
     vocab_size = data_module.tokenizer.vocab_size
+
+    # Apply model-size presets if requested
+    if args.model_size is not None:
+        if args.model_size == "small":
+            args.embed_dim, args.depth, args.num_heads, args.ff_hidden_dim = 512, 8, 8, 2048
+        elif args.model_size == "base":
+            args.embed_dim, args.depth, args.num_heads, args.ff_hidden_dim = 768, 12, 12, 3072
+        elif args.model_size == "large":
+            args.embed_dim, args.depth, args.num_heads, args.ff_hidden_dim = 1024, 16, 16, 4096
 
     module = DiffusionLLMModule(
         vocab_size=vocab_size,
@@ -365,7 +406,14 @@ def main() -> None:
     )
     module.tokenizer = data_module.tokenizer
 
-    trainer = pl.Trainer(max_epochs=args.epochs, log_every_n_steps=1, enable_checkpointing=False)
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        log_every_n_steps=1,
+        enable_checkpointing=False,
+        gradient_clip_val=1.0,
+        precision=args.precision,
+        accumulate_grad_batches=args.accumulate_grad_batches,
+    )
     trainer.fit(module, datamodule=data_module)
     val_metrics = trainer.validate(module, datamodule=data_module)
 
@@ -388,7 +436,7 @@ def main() -> None:
         seq_len=args.block_size,
         steps=args.steps,
         prompt=args.prompt,
-        sampler="huen",
+        sampler="heun",
     )
     print("=== Sampled Text ===")
     print(generated)

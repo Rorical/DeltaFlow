@@ -401,7 +401,6 @@ class DLLM(nn.Module):
         pad_token_id: int = 0,
         time_hidden_dim: Optional[int] = None,
         label_smoothing: float = 0.01,
-        weight_exponent: float = 1.0,
         norm_epsilon: float = 1e-4,
     ):
         super().__init__()
@@ -412,7 +411,6 @@ class DLLM(nn.Module):
         self.embed_dim = embed_dim
         self.pad_token_id = pad_token_id
         self.label_smoothing = label_smoothing
-        self.weight_exponent = weight_exponent
         self.norm_epsilon = norm_epsilon
 
         self.token_embedding = nn.Linear(vocab_size, embed_dim)
@@ -509,8 +507,7 @@ class DLLM(nn.Module):
         hidden = self.backbone(inputs, mask=attn_mask)
         hidden = self.final_norm(hidden)
         velocity = self.logits_mapping(hidden)
-        velocity = velocity - velocity.mean(dim=-1, keepdim=True)
-        scale = torch.exp(self.velocity_log_scale).to(velocity.dtype)
+        scale = torch.exp(self.velocity_log_scale.clamp(-4.0, 4.0)).to(velocity.dtype)
         velocity = velocity * scale
         return velocity
 
@@ -534,13 +531,11 @@ class DLLM(nn.Module):
             t = torch.rand(batch_size, seq_len, 1, device=device, dtype=target_logits.dtype)
         else:
             t = self._expand_timesteps(timesteps, batch_size, seq_len, device).to(target_logits.dtype)
-        t = t.clamp(1e-4, 1 - 1e-4)
 
         init_logits = self._sample_logits(target_logits.shape, device=device, dtype=target_logits.dtype)
 
         state_logits = (1.0 - t) * init_logits + t * target_logits
         velocity_target = target_logits - init_logits
-        velocity_target = velocity_target - velocity_target.mean(dim=-1, keepdim=True)
 
         if padding_mask is not None:
             mask = padding_mask.to(device=device, dtype=target_logits.dtype).unsqueeze(-1)
@@ -666,6 +661,7 @@ class DLLM(nn.Module):
         else:
             raise ValueError(f"Unknown sampler '{sampler}'. Supported samplers: 'euler', 'heun'.")
 
+        logits = self.state_norm(logits)
         if temperature != 1.0:
             logits = logits / temperature
 
