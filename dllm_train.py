@@ -4,6 +4,7 @@ import argparse
 import math
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -386,6 +387,15 @@ def main() -> None:
     )
     print("=== Sampled Text ===")
     print(generated)
+
+    checkpoint_path = Path("dllm_checkpoint.pt")
+    checkpoint = {
+        "model_state_dict": module.model.state_dict(),
+        "tokenizer_name": data_module.cfg.tokenizer_name,
+        "args": vars(args),
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path.resolve()}")
 
 
 if __name__ == "__main__":
