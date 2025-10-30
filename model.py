@@ -6,7 +6,8 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-
+import matplotlib.pyplot as plt
+import numpy as np
 
 def _rotate_half(x: Tensor) -> Tensor:
     """
@@ -398,20 +399,10 @@ class DLLM(nn.Module):
         layer_norm_eps: float = 1e-5,
         bias: bool = True,
         pad_token_id: int = 0,
-        final_layer_norm: bool = True,
         time_hidden_dim: Optional[int] = None,
-        logit_scale: float = 6.0,
-        softmax_temperature: float = 1.0,
-        init_scale: float = 0.5,
-        noise_std: float = 0.2,
-        target_noise_std: float = 0.1,
-        weight_exponent: float = 2.0,
-        reg_lambda: float = 1e-4,
-        recon_lambda: float = 0.05,
-        direction_lambda: float = 0.3,
+        label_smoothing: float = 0.01,
+        weight_exponent: float = 1.0,
         norm_epsilon: float = 1e-4,
-        context_prob: float = 0.1,
-        logit_embed_scale: float = 0.1,
     ):
         super().__init__()
         if vocab_size <= 0:
@@ -420,22 +411,15 @@ class DLLM(nn.Module):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.pad_token_id = pad_token_id
-        self.logit_scale = logit_scale
-        self.softmax_temperature = softmax_temperature
-        self.init_scale = init_scale
-        self.noise_std = noise_std
-        self.target_noise_std = target_noise_std
+        self.label_smoothing = label_smoothing
         self.weight_exponent = weight_exponent
-        self.reg_lambda = reg_lambda
-        self.recon_lambda = recon_lambda
-        self.direction_lambda = direction_lambda
         self.norm_epsilon = norm_epsilon
-        self.context_prob = context_prob
-        self.logit_embed_scale = nn.Parameter(torch.tensor(logit_embed_scale, dtype=torch.float32))
 
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.embed_to_vocab = nn.Linear(embed_dim, vocab_size, bias=True)
-        self.vocab_to_embed = nn.Linear(vocab_size, embed_dim, bias=False)
+        self.token_embedding = nn.Linear(vocab_size, embed_dim)
+        self.logits_mapping = nn.Linear(embed_dim, vocab_size)
+        self.state_norm = nn.LayerNorm(vocab_size, eps=norm_epsilon, elementwise_affine=True)
+        self.velocity_log_scale = nn.Parameter(torch.tensor(0.0))
+
         self.backbone = TransformerStack(
             depth=depth,
             embed_dim=embed_dim,
@@ -446,8 +430,31 @@ class DLLM(nn.Module):
             layer_norm_eps=layer_norm_eps,
             bias=bias,
         )
-        self.final_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps) if final_layer_norm else None
+        self.final_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         self.time_embedding = TimestepEmbedding(embed_dim, hidden_dim=time_hidden_dim)
+
+    def _prob2logit(self, p, eps=1e-12):
+        logp = torch.log(p.clamp_min(eps))
+        centered = logp - logp.mean(dim=-1, keepdim=True)
+        std = centered.std(dim=-1, unbiased=False, keepdim=True)
+        ln_logit = centered / (std + self.norm_epsilon)
+        return ln_logit
+    
+    def embed_token(self, input_ids, eps=1e-12):
+        one_hot = F.one_hot(input_ids, num_classes=self.vocab_size).to(dtype=self.token_embedding.weight.dtype)
+        if self.label_smoothing > 0.0:
+            smoothing = float(self.label_smoothing)
+            off_value = smoothing / max(self.vocab_size - 1, 1)
+            on_value = 1.0 - smoothing
+            one_hot = one_hot * on_value + (1.0 - one_hot) * off_value
+        logits = self._prob2logit(one_hot, eps)
+        return self.state_norm(logits)
+
+    def _sample_logits(self, shape: tuple[int, ...], device=None, dtype=None):
+        device = device or self.token_embedding.weight.device
+        dtype = dtype or self.token_embedding.weight.dtype
+        x = torch.randn(*shape, device=device, dtype=dtype)
+        return self.state_norm(x)
 
     def _expand_timesteps(self, timesteps: Optional[Tensor], batch_size: int, seq_len: int, device: torch.device) -> Tensor:
         if timesteps is None:
@@ -472,20 +479,8 @@ class DLLM(nn.Module):
 
         return timesteps.to(device=device, dtype=torch.float32)
 
-    def _build_target_logits(self, token_ids: Tensor) -> Tensor:
-        embeddings = self.token_embedding(token_ids)
-        if self.target_noise_std > 0:
-            embeddings = embeddings + torch.randn_like(embeddings) * self.target_noise_std
-
-        logits = self.embed_to_vocab(embeddings)
-        logits = logits - logits.mean(dim=-1, keepdim=True)
-        return logits * self.logit_scale
-
     def _logits_to_embedding(self, logits: Tensor) -> Tensor:
-        probs = torch.softmax(logits / self.softmax_temperature, dim=-1)
-        prob_embed = torch.matmul(probs, self.token_embedding.weight)
-        logit_embed = self.vocab_to_embed(logits)
-        return prob_embed + self.logit_embed_scale * logit_embed
+        return self.token_embedding(logits)
 
     def forward(
         self,
@@ -504,20 +499,19 @@ class DLLM(nn.Module):
     ) -> Tensor:
         if logits.dim() != 3 or logits.size(-1) != self.vocab_size:
             raise ValueError("logits must have shape (batch, seq_len, vocab_size).")
-
         batch_size, seq_len, _ = logits.shape
+        logits = self.state_norm(logits)
         device = logits.device
         timesteps = self._expand_timesteps(timesteps, batch_size, seq_len, device)
-
         inputs = self._logits_to_embedding(logits)
         inputs = inputs + self.time_embedding(timesteps)
-
         attn_mask = _build_padding_attention_mask(padding_mask, seq_len, device)
         hidden = self.backbone(inputs, mask=attn_mask)
-        if self.final_norm is not None:
-            hidden = self.final_norm(hidden)
-
-        velocity = self.embed_to_vocab(hidden)
+        hidden = self.final_norm(hidden)
+        velocity = self.logits_mapping(hidden)
+        velocity = velocity - velocity.mean(dim=-1, keepdim=True)
+        scale = torch.exp(self.velocity_log_scale).to(velocity.dtype)
+        velocity = velocity * scale
         return velocity
 
     def loss(
@@ -534,103 +528,51 @@ class DLLM(nn.Module):
         batch_size, seq_len = token_ids.shape
         device = token_ids.device
 
-        target_logits = self._build_target_logits(token_ids)
-        timesteps = self._expand_timesteps(timesteps, batch_size, seq_len, device)
+        target_logits = self.embed_token(token_ids)
 
-        if self.context_prob > 0:
-            context_mask = torch.bernoulli(
-                torch.full((batch_size, seq_len), self.context_prob, device=device)
-            )
-            if padding_mask is not None:
-                context_mask = context_mask * padding_mask
+        if timesteps is None:
+            t = torch.rand(batch_size, seq_len, 1, device=device, dtype=target_logits.dtype)
         else:
-            context_mask = torch.zeros(batch_size, seq_len, device=device)
+            t = self._expand_timesteps(timesteps, batch_size, seq_len, device).to(target_logits.dtype)
+        t = t.clamp(1e-4, 1 - 1e-4)
 
-        context_mask_expanded = context_mask.unsqueeze(-1)
-        timesteps = timesteps * (1.0 - context_mask_expanded) + context_mask_expanded
+        init_logits = self._sample_logits(target_logits.shape, device=device, dtype=target_logits.dtype)
 
-        init_logits = torch.randn_like(target_logits) * self.init_scale
-        state_logits = (1.0 - timesteps) * init_logits + timesteps * target_logits
-        delta = (1.0 - timesteps).clamp_min(1e-4)
-
-        if self.noise_std > 0:
-            noise = torch.randn_like(state_logits) * self.noise_std
-            state_logits = state_logits + delta * noise * (1.0 - context_mask_expanded)
+        state_logits = (1.0 - t) * init_logits + t * target_logits
+        velocity_target = target_logits - init_logits
+        velocity_target = velocity_target - velocity_target.mean(dim=-1, keepdim=True)
 
         if padding_mask is not None:
             mask = padding_mask.to(device=device, dtype=target_logits.dtype).unsqueeze(-1)
             target_logits = target_logits * mask
             init_logits = init_logits * mask
             state_logits = state_logits * mask
-            delta = delta * mask + (1.0 - mask)
-            context_mask_expanded = context_mask_expanded * mask
-            context_mask = context_mask * padding_mask
+            velocity_target = velocity_target * mask
 
-        velocity_pred = self.predict_velocity(state_logits, timesteps=timesteps, padding_mask=padding_mask)
-        velocity_target = target_logits - state_logits
+        velocity_pred = self.predict_velocity(state_logits, timesteps=t, padding_mask=padding_mask)
 
-        norm = velocity_target.norm(dim=-1, keepdim=True).clamp_min(self.norm_epsilon)
-        velocity_target_unit = velocity_target / norm
-        velocity_pred_unit = velocity_pred / norm
+        velocity_mse = (velocity_pred - velocity_target) ** 2
 
-        residual_loss = (velocity_pred - velocity_target) ** 2
-        direction_loss = (velocity_pred_unit - velocity_target_unit) ** 2
-        diff = (residual_loss + self.direction_lambda * direction_loss) * (1.0 - context_mask_expanded)
-        weights = (1.0 - timesteps).squeeze(-1).pow(self.weight_exponent)
-        weights = weights * (1.0 - context_mask)
+        weights = torch.ones_like(t)
         if padding_mask is not None:
-            mask = padding_mask.to(device=device, dtype=diff.dtype)
-            weights = weights * mask
-            diff = diff * mask.unsqueeze(-1)
+            weights = weights * padding_mask.unsqueeze(-1)
 
-        weights = weights.unsqueeze(-1)
-        diff = diff * weights
-        denom = weights.sum() * diff.shape[-1]
-        flow_loss = diff.sum() / denom.clamp_min(1.0)
+        weighted_error = velocity_mse * weights
+        denom = weights.sum().clamp_min(1.0)
+        flow_loss = weighted_error.sum() / denom
+        flow_loss = flow_loss / math.sqrt(self.vocab_size)
+
+        #cos_loss = 1.0 - (velocity_pred * velocity_target).sum(dim=-1) / (
+        #    velocity_pred.norm(dim=-1) * velocity_target.norm(dim=-1) + 1e-12
+        #)
+        #weighted_cos_loss = (cos_loss * weights.squeeze(-1)).sum() / weights.sum().clamp_min(1.0)
         loss = flow_loss
-
-        if self.reg_lambda > 0:
-            reg = velocity_pred.pow(2) * (1.0 - context_mask_expanded)
-            if padding_mask is not None:
-                mask = padding_mask.to(device=device, dtype=reg.dtype).unsqueeze(-1)
-                reg = reg * mask
-                reg_denom = mask.sum() * reg.shape[-1]
-            else:
-                reg_denom = reg.new_tensor(reg.numel())
-            reg_loss = reg.sum() / reg_denom.clamp_min(1.0)
-            reg_term = self.reg_lambda * reg_loss
-            loss = loss + reg_term
-        else:
-            reg_loss = diff.new_tensor(0.0)
-            reg_term = diff.new_tensor(0.0)
-
-        if self.recon_lambda > 0:
-            pred_logits = state_logits + delta * velocity_pred
-            recon_targets = token_ids.clone()
-            if self.context_prob > 0:
-                context_ignore = context_mask.bool()
-                recon_targets = recon_targets.masked_fill(context_ignore, self.pad_token_id)
-            recon_loss = F.cross_entropy(
-                pred_logits.view(-1, self.vocab_size),
-                recon_targets.view(-1),
-                ignore_index=self.pad_token_id,
-            )
-            recon_term = self.recon_lambda * recon_loss
-            loss = loss + recon_term
-        else:
-            recon_loss = diff.new_tensor(0.0)
-            recon_term = diff.new_tensor(0.0)
 
         if return_components:
             components = {
                 "loss_total": loss.detach(),
                 "loss_flow": flow_loss.detach(),
-                "loss_residual_mse": residual_loss.mean().detach(),
-                "loss_direction_mse": direction_loss.mean().detach(),
-                "loss_reg": reg_loss.detach(),
-                "loss_reg_term": reg_term.detach(),
-                "loss_recon": recon_loss.detach(),
-                "loss_recon_term": recon_term.detach(),
+                "loss_velocity_mse": velocity_mse.mean().detach(),
             }
             return loss, components
 
@@ -654,7 +596,7 @@ class DLLM(nn.Module):
             raise ValueError("steps must be a positive integer.")
 
         device = device or self.token_embedding.weight.device
-        logits = torch.randn(batch_size, seq_len, self.vocab_size, device=device) * self.init_scale
+        logits = self._sample_logits((batch_size, seq_len, self.vocab_size), device=device)
 
         if padding_mask is None:
             padding_mask = torch.ones(batch_size, seq_len, device=device, dtype=torch.long)
@@ -673,7 +615,7 @@ class DLLM(nn.Module):
                 raise ValueError("conditional_tokens must have shape (batch_size, seq_len)")
             conditional_mask_bool = conditional_tokens != self.pad_token_id
             if conditional_mask_bool.any():
-                conditional_logits = self._build_target_logits(conditional_tokens)
+                conditional_logits = self.embed_token(conditional_tokens)
                 mask_float = conditional_mask_bool.unsqueeze(-1).to(dtype=logits.dtype)
                 logits = logits * (1.0 - mask_float) + conditional_logits * mask_float
 

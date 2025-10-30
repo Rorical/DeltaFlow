@@ -190,8 +190,8 @@ class DiffusionLLMModule(pl.LightningModule):
         )
         for name, value in components.items():
             if stage == "train":
-                on_step = name in {"loss_flow", "loss_recon_term"}
-                prog_bar = name in {"loss_flow", "loss_recon_term"}
+                on_step = name in {"loss_flow", "loss_velocity_mse"}
+                prog_bar = name in {"loss_flow", "loss_velocity_mse"}
             else:
                 on_step = False
                 prog_bar = False
@@ -241,7 +241,7 @@ class DiffusionLLMModule(pl.LightningModule):
                     seq_len=self.sample_seq_len,
                     steps=20,
                     device=loss.device,
-                    sampler="heun",
+                    sampler="euler",
                     conditional_tokens=conditional_tokens,
                 )
                 text = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)[0]
@@ -254,15 +254,20 @@ class DiffusionLLMModule(pl.LightningModule):
         with torch.no_grad():
             token_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
-            t = torch.ones_like(token_ids, dtype=torch.float32, device=loss.device) * 0.9
+            # Evaluate recovery from near-pure noise by starting at t = 0
+            t = torch.zeros_like(token_ids, dtype=torch.float32, device=loss.device)
 
-            target_logits = self.model._build_target_logits(token_ids).detach()
-            init_logits = torch.randn_like(target_logits) * self.model.init_scale
+            target_logits = self.model.embed_token(token_ids).detach()
+            init_logits = self.model._sample_logits(
+                target_logits.shape, device=loss.device, dtype=target_logits.dtype
+            )
             state_logits = (1.0 - t.unsqueeze(-1)) * init_logits + t.unsqueeze(-1) * target_logits
+            state_logits = self.model.state_norm(state_logits)
             delta = (1.0 - t).unsqueeze(-1)
 
             velocity = self.model.predict_velocity(state_logits, timesteps=t.unsqueeze(-1), padding_mask=attention_mask)
             pred_logits = state_logits + delta * velocity
+            pred_logits = self.model.state_norm(pred_logits)
             preds = pred_logits.argmax(dim=-1)
             mask = attention_mask.bool()
             correct = (preds == token_ids).masked_fill(~mask, False).sum()
@@ -278,7 +283,7 @@ class DiffusionLLMModule(pl.LightningModule):
         *,
         steps: int = 10,
         prompt: Optional[str] = None,
-        sampler: str = "heun",
+        sampler: str = "huen",
     ) -> str:
         self.eval()
         device = next(self.parameters()).device
@@ -328,7 +333,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=50, help="Sampling steps during evaluation.")
+    parser.add_argument("--steps", type=int, default=100, help="Sampling steps during evaluation.")
     parser.add_argument("--prompt", type=str, default="Once upon", help="Prompt text for conditional sampling.")
     parser.add_argument("--sample-interval", type=int, default=0, help="Training sample interval in steps (0 to disable).")
     parser.add_argument("--sample-seq-len", type=int, default=64, help="Sequence length for periodic training samples.")
@@ -383,7 +388,7 @@ def main() -> None:
         seq_len=args.block_size,
         steps=args.steps,
         prompt=args.prompt,
-        sampler="heun",
+        sampler="huen",
     )
     print("=== Sampled Text ===")
     print(generated)
