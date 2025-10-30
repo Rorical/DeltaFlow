@@ -400,17 +400,17 @@ class DLLM(nn.Module):
         pad_token_id: int = 0,
         final_layer_norm: bool = True,
         time_hidden_dim: Optional[int] = None,
-        logit_scale: float = 5.0,
+        logit_scale: float = 6.0,
         softmax_temperature: float = 1.0,
-        init_scale: float = 1.0,
-        noise_std: float = 0.1,
-        target_noise_std: float = 0.05,
-        weight_exponent: float = 1.0,
+        init_scale: float = 0.5,
+        noise_std: float = 0.2,
+        target_noise_std: float = 0.1,
+        weight_exponent: float = 2.0,
         reg_lambda: float = 1e-4,
-        recon_lambda: float = 0.1,
-        direction_lambda: float = 0.1,
+        recon_lambda: float = 0.05,
+        direction_lambda: float = 0.3,
         norm_epsilon: float = 1e-4,
-        context_prob: float = 0.2,
+        context_prob: float = 0.1,
         logit_embed_scale: float = 0.1,
     ):
         super().__init__()
@@ -729,7 +729,11 @@ class DLLM(nn.Module):
 
         probs = torch.softmax(logits, dim=-1)
         if deterministic:
-            return probs.argmax(dim=-1)
+            tokens = probs.argmax(dim=-1)
+        else:
+            tokens = torch.multinomial(probs.view(-1, self.vocab_size), 1).view(batch_size, seq_len)
 
-        sampled = torch.multinomial(probs.view(-1, self.vocab_size), 1).view(batch_size, seq_len)
-        return sampled
+        if conditional_tokens is not None and conditional_mask_bool.any():
+            tokens = torch.where(conditional_mask_bool, conditional_tokens, tokens)
+
+        return tokens

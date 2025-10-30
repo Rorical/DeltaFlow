@@ -143,6 +143,9 @@ class DiffusionLLMModule(pl.LightningModule):
         ff_hidden_dim: Optional[int],
         lr: float,
         pad_token_id: int,
+        sample_interval: int = 1000,
+        sample_seq_len: int = 64,
+        sample_prompt: Optional[str] = None,
     ):
         super().__init__()
         self.model = DLLM(
@@ -155,6 +158,10 @@ class DiffusionLLMModule(pl.LightningModule):
         )
         self.lr = lr
         self.pad_token_id = pad_token_id
+        self.sample_interval = sample_interval
+        self.sample_seq_len = sample_seq_len
+        self.sample_prompt = sample_prompt
+        self.tokenizer: Optional[AutoTokenizer] = None
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -199,7 +206,47 @@ class DiffusionLLMModule(pl.LightningModule):
         return loss
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        return self._shared_step(batch, "train")
+        loss = self._shared_step(batch, "train")
+        global_step = self.global_step
+        if (
+            self.tokenizer is not None
+            and self.sample_interval > 0
+            and global_step % self.sample_interval == 0
+        ):
+            with torch.no_grad():
+                conditional_tokens = None
+                if self.sample_prompt and self.tokenizer is not None:
+                    encoded = self.tokenizer(
+                        self.sample_prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=self.sample_seq_len,
+                    )
+                    cond_ids = encoded["input_ids"].to(loss.device)
+                    if cond_ids.size(1) < self.sample_seq_len:
+                        cond_full = torch.full(
+                            (cond_ids.size(0), self.sample_seq_len),
+                            self.tokenizer.pad_token_id,
+                            device=loss.device,
+                            dtype=torch.long,
+                        )
+                        cond_full[:, : cond_ids.size(1)] = cond_ids
+                    else:
+                        cond_full = cond_ids[:, : self.sample_seq_len]
+                    conditional_tokens = cond_full
+
+                tokens = self.model.sample(
+                    batch_size=1,
+                    seq_len=self.sample_seq_len,
+                    steps=20,
+                    device=loss.device,
+                    sampler="heun",
+                    conditional_tokens=conditional_tokens,
+                )
+                text = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)[0]
+                self.log("train_sample_len", torch.tensor(len(text), device=loss.device))
+                self.print(f"\n[Sample @ step {global_step}] {text}\n")
+        return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         loss = self._shared_step(batch, "val")
@@ -223,7 +270,15 @@ class DiffusionLLMModule(pl.LightningModule):
             self.log("val_accuracy", acc, prog_bar=True, on_epoch=True, batch_size=token_ids.size(0))
         return loss
 
-    def sample(self, tokenizer: AutoTokenizer, seq_len: int, *, steps: int = 10, prompt: Optional[str] = None) -> str:
+    def sample(
+        self,
+        tokenizer: AutoTokenizer,
+        seq_len: int,
+        *,
+        steps: int = 10,
+        prompt: Optional[str] = None,
+        sampler: str = "heun",
+    ) -> str:
         self.eval()
         device = next(self.parameters()).device
         with torch.no_grad():
@@ -255,7 +310,7 @@ class DiffusionLLMModule(pl.LightningModule):
                 steps=steps,
                 device=device,
                 conditional_tokens=conditional_tokens,
-                sampler="heun",
+                sampler=sampler,
             )
             text = tokenizer.batch_decode(tokens, skip_special_tokens=True)[0]
         return text
@@ -274,6 +329,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--steps", type=int, default=50, help="Sampling steps during evaluation.")
     parser.add_argument("--prompt", type=str, default="Once upon", help="Prompt text for conditional sampling.")
+    parser.add_argument("--sample-interval", type=int, default=0, help="Training sample interval in steps (0 to disable).")
+    parser.add_argument("--sample-seq-len", type=int, default=64, help="Sequence length for periodic training samples.")
+    parser.add_argument("--sample-prompt", type=str, default=None, help="Prompt used for periodic training samples.")
     return parser.parse_args()
 
 
@@ -295,7 +353,11 @@ def main() -> None:
         ff_hidden_dim=args.ff_hidden_dim,
         lr=args.lr,
         pad_token_id=data_module.pad_token_id,
+        sample_interval=args.sample_interval,
+        sample_seq_len=args.sample_seq_len,
+        sample_prompt=args.sample_prompt or args.prompt,
     )
+    module.tokenizer = data_module.tokenizer
 
     trainer = pl.Trainer(max_epochs=args.epochs, log_every_n_steps=1, enable_checkpointing=False)
     trainer.fit(module, datamodule=data_module)
