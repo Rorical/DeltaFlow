@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 
 import pytorch_lightning as pl
 
-from llm_model import LLM
+from sllm_model import LLM
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 @dataclass
@@ -142,6 +142,8 @@ class AutoregressiveLLMModule(pl.LightningModule):
         ff_hidden_dim: Optional[int],
         lr: float,
         pad_token_id: int,
+        step_size: float,
+        initial_velocity: str,
     ):
         super().__init__()
         self.model = LLM(
@@ -150,6 +152,8 @@ class AutoregressiveLLMModule(pl.LightningModule):
             depth=depth,
             num_heads=num_heads,
             ff_hidden_dim=ff_hidden_dim,
+            step_size=step_size,
+            initial_velocity=initial_velocity,
         )
         self.lr = lr
         self.pad_token_id = pad_token_id
@@ -209,7 +213,7 @@ class AutoregressiveLLMModule(pl.LightningModule):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train LLM on WikiText using PyTorch Lightning")
+    parser = argparse.ArgumentParser(description="Train second-order LLM on WikiText using PyTorch Lightning")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--embed-dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=4)
@@ -221,6 +225,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=50)
     parser.add_argument("--prompt", type=str, default="Once upon a time")
+    parser.add_argument("--step-size", type=float, default=1.0, help="Integration step size for each residual layer.")
+    parser.add_argument(
+        "--initial-velocity",
+        choices=["linear", "zero"],
+        default="linear",
+        help="Strategy for initializing the velocity state.",
+    )
     return parser.parse_args()
 
 
@@ -242,6 +253,8 @@ def main() -> None:
         ff_hidden_dim=args.ff_hidden_dim,
         lr=args.lr,
         pad_token_id=data_module.pad_token_id,
+        step_size=args.step_size,
+        initial_velocity=args.initial_velocity,
     )
 
     trainer = pl.Trainer(max_epochs=args.epochs, log_every_n_steps=1, enable_checkpointing=False)
