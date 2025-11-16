@@ -20,37 +20,28 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from sllm_model import LLM
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-@dataclass
-class DataConfig:
-    dataset_name: str = "wikitext"
-    dataset_config: str = "wikitext-2-raw-v1"
-    tokenizer_name: str = "gpt2"
-    block_size: int = 128
-    batch_size: int = 2
-    num_workers: int = 0
-
 
 @dataclass
 class TrainConfig:
     epochs: int = 1
-    embed_dim: int = 256
-    depth: int = 4
-    num_heads: int = 8
-    ff_hidden_dim: Optional[int] = None
-    base_lr: float = 3e-4
-    lr_scale_reference_batch: int = 2
+    embed_dim: int = 768
+    depth: int = 12
+    num_heads: int = 12
+    ff_hidden_dim: Optional[int] = 3072
+    base_lr: float = 5e-4
+    lr_scale_reference_batch: int = 4
     weight_decay: float = 0.01
     warmup_steps: int = 200
     min_lr: float = 1e-5
-    batch_size: int = 2
-    block_size: int = 128
+    batch_size: int = 4
+    block_size: int = 1024
     num_workers: int = 0
     max_new_tokens: int = 50
     prompt: str = "Once upon a time"
     step_size: float = 1.0
     initial_velocity: str = "linear"
     dataset_name: str = "wikitext"
-    dataset_config: str = "wikitext-2-raw-v1"
+    dataset_config: str = "wikitext-103-v1"
     tokenizer_name: str = "gpt2"
     seed: int = 42
     grad_clip_norm: float = 1.0
@@ -82,9 +73,9 @@ def _group_texts(examples: Dict[str, List[List[int]]], block_size: int) -> Dict[
 
 
 class WikiTextDataModule(pl.LightningDataModule):
-    def __init__(self, data_cfg: DataConfig):
+    def __init__(self, cfg: TrainConfig):
         super().__init__()
-        self.cfg = data_cfg
+        self.cfg = cfg
         self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -406,15 +397,7 @@ def main() -> None:
     train_cfg = TrainConfig()
 
     pl.seed_everything(train_cfg.seed, workers=True)
-    data_cfg = DataConfig(
-        dataset_name=train_cfg.dataset_name,
-        dataset_config=train_cfg.dataset_config,
-        tokenizer_name=train_cfg.tokenizer_name,
-        block_size=train_cfg.block_size,
-        batch_size=train_cfg.batch_size,
-        num_workers=train_cfg.num_workers,
-    )
-    data_module = WikiTextDataModule(data_cfg)
+    data_module = WikiTextDataModule(train_cfg)
     data_module.setup()
 
     vocab_size = data_module.tokenizer.vocab_size
