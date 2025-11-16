@@ -291,7 +291,6 @@ class SecondOrderTransformerLayer(nn.Module):
         x: Tensor,
         v: Tensor,
         mask: Optional[Tensor] = None,
-        layer_embedding: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         """
         Args:
@@ -304,8 +303,6 @@ class SecondOrderTransformerLayer(nn.Module):
 
         # First update: attention predicts acceleration.
         fused = self._attn_state(x, v)
-        if layer_embedding is not None:
-            fused = fused + layer_embedding
         attn_in = self.accel_norm1(fused)
         accel_attn = self.attn_dropout(self.attention(attn_in, mask=mask))
         v = v + step * accel_attn
@@ -313,8 +310,6 @@ class SecondOrderTransformerLayer(nn.Module):
 
         # Second update: feed-forward predicts acceleration.
         fused = self._ffn_state(x, v)
-        if layer_embedding is not None:
-            fused = fused + layer_embedding
         ff_in = self.accel_norm2(fused)
         accel_ff = self.ff_dropout(self.feed_forward(ff_in))
         v = v + step * accel_ff
@@ -348,27 +343,31 @@ class SecondOrderTransformerStack(nn.Module):
         if initial_velocity not in {"zero", "linear"}:
             raise ValueError("initial_velocity must be 'zero' or 'linear'.")
         self.depth = depth
-        self.layer = SecondOrderTransformerLayer(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            ff_hidden_dim=ff_hidden_dim,
-            dropout=dropout,
-            rotary_dim=rotary_dim,
-            layer_norm_eps=layer_norm_eps,
-            bias=bias,
-            step_size=step_size,
+        self.layers = nn.ModuleList(
+            [
+                SecondOrderTransformerLayer(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    ff_hidden_dim=ff_hidden_dim,
+                    dropout=dropout,
+                    rotary_dim=rotary_dim,
+                    layer_norm_eps=layer_norm_eps,
+                    bias=bias,
+                    step_size=step_size,
+                )
+                for _ in range(depth)
+            ]
         )
         self.initial_velocity = initial_velocity
         self.velocity_proj = nn.Linear(embed_dim, embed_dim, bias=bias) if initial_velocity == "linear" else None
         self.embed_dim = embed_dim
-        self.layer_time_embed = nn.Parameter(torch.zeros(depth, embed_dim))
-        self.layer_time_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
 
     def warmup_rotary_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> None:
         """
         Make sure the rotary embeddings run in cached mode once training starts.
         """
-        self.layer.attention.rotary.warmup_cache(seq_len, device=device, dtype=dtype)
+        for layer in self.layers:
+            layer.attention.rotary.warmup_cache(seq_len, device=device, dtype=dtype)
 
     def forward(
         self,
@@ -381,10 +380,8 @@ class SecondOrderTransformerStack(nn.Module):
         else:
             v = self.velocity_proj(x)
 
-        for idx in range(self.depth):
-            layer_embed = self.layer_time_norm(self.layer_time_embed[idx])
-            layer_embed = layer_embed.to(dtype=x.dtype, device=x.device).view(1, 1, -1)
-            x, v = self.layer(x, v, mask=mask, layer_embedding=layer_embed)
+        for layer in self.layers:
+            x, v = layer(x, v, mask=mask)
 
         if return_velocity:
             return x, v
