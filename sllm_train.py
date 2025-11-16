@@ -17,7 +17,10 @@ from transformers import AutoTokenizer
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from sllm_model import LLM
+try:
+    from sllm_model import LLM
+except ModuleNotFoundError:
+    pass
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
@@ -33,7 +36,7 @@ class TrainConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 200
     min_lr: float = 1e-5
-    batch_size: int = 4
+    batch_size: int = 16
     block_size: int = 1024
     num_workers: int = 4
     prefetch_factor: Optional[int] = 2
