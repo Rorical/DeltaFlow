@@ -119,10 +119,13 @@ class WikiTextDataModule(pl.LightningDataModule):
 
         split = lm_datasets["train"].train_test_split(test_size=0.05, seed=42)
         val_dataset = lm_datasets["validation"]
+        test_dataset = lm_datasets.get("test", None)
+        if test_dataset is None:
+            test_dataset = split["test"]
         self.dataset = {
             "train": split["train"],
             "validation": val_dataset,
-            "eval": split["test"],
+            "test": test_dataset,
         }
 
     def collate_fn(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -150,7 +153,7 @@ class WikiTextDataModule(pl.LightningDataModule):
         return self._build_loader(self.dataset["validation"], shuffle=False)
 
     def test_dataloader(self) -> DataLoader:
-        return self._build_loader(self.dataset["eval"], shuffle=False)
+        return self._build_loader(self.dataset["test"], shuffle=False)
 
 
 class AutoregressiveLLMModule(pl.LightningModule):
@@ -302,10 +305,15 @@ class AutoregressiveLLMModule(pl.LightningModule):
         with self._autocast_context():
             logits = self.model(inputs, padding_mask=padding)
             vocab_size = logits.size(-1)
+            targets_flat = targets.reshape(-1)
+            padding_flat = padding.reshape(-1)
+            ignore_mask = padding_flat == 0
+            if ignore_mask.any():
+                targets_flat = targets_flat.masked_fill(ignore_mask, -100)
             loss = F.cross_entropy(
                 logits.view(-1, vocab_size),
-                targets.reshape(-1),
-                ignore_index=self.pad_token_id,
+                targets_flat,
+                ignore_index=-100,
             )
         self.log(
             f"{stage}_loss",

@@ -175,7 +175,6 @@ class SelfAttention(nn.Module):
         self.rotary = RotaryEmbedding(self.rotary_dim)
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.dropout = nn.Dropout(dropout)
 
     def _shape(self, tensor: Tensor, seq_len: int, batch_size: int) -> Tensor:
         return tensor.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -198,32 +197,22 @@ class SelfAttention(nn.Module):
         cos, sin = self.rotary(seq_len, device=x.device, dtype=q.dtype)
         q, k = _apply_rotary_pos_emb(q, k, cos, sin, self.rotary_dim)
 
+        attn_mask = None
         if mask is not None:
             if mask.dtype != torch.bool:
                 mask = mask != 0
             if mask.dim() == 2:
                 mask = mask[:, None, None, :]
+            attn_mask = mask
 
-        if hasattr(F, "scaled_dot_product_attention"):
-            dropout_p = self.dropout.p if self.training else 0.0
-            context = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask,
-                dropout_p=dropout_p,
-                is_causal=False,
-            )
-        else:
-            scale = 1.0 / math.sqrt(self.head_dim)
-            scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        scale = 1.0 / math.sqrt(self.head_dim)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
 
-            if mask is not None:
-                scores = scores.masked_fill(~mask, float("-inf"))
+        if attn_mask is not None:
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
 
-            attn = F.softmax(scores, dim=-1)
-            attn = self.dropout(attn)
-            context = torch.matmul(attn, v)
+        attn = F.softmax(scores, dim=-1)
+        context = torch.matmul(attn, v)
 
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
         output = self.out_proj(context)
