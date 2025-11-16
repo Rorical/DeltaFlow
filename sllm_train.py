@@ -108,6 +108,7 @@ class WikiTextDataModule(pl.LightningDataModule):
             num_workers=self.cfg.num_workers,
             collate_fn=self.collate_fn,
             persistent_workers=self.cfg.num_workers > 0,
+            drop_last=True,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -118,6 +119,7 @@ class WikiTextDataModule(pl.LightningDataModule):
             num_workers=self.cfg.num_workers,
             collate_fn=self.collate_fn,
             persistent_workers=self.cfg.num_workers > 0,
+            drop_last=True,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -128,6 +130,7 @@ class WikiTextDataModule(pl.LightningDataModule):
             num_workers=self.cfg.num_workers,
             collate_fn=self.collate_fn,
             persistent_workers=self.cfg.num_workers > 0,
+            drop_last=True,
         )
 
 
@@ -144,8 +147,11 @@ class AutoregressiveLLMModule(pl.LightningModule):
         pad_token_id: int,
         step_size: float,
         initial_velocity: str,
+        context_length: int,
     ):
         super().__init__()
+        if context_length <= 0:
+            raise ValueError("context_length must be a positive integer.")
         self.model = LLM(
             vocab_size=vocab_size,
             embed_dim=embed_dim,
@@ -157,9 +163,27 @@ class AutoregressiveLLMModule(pl.LightningModule):
         )
         self.lr = lr
         self.pad_token_id = pad_token_id
+        self.context_length = context_length
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+    def _warmup_rotary_cache(self) -> None:
+        device = next(self.model.parameters()).device
+        dtype = next(self.model.parameters()).dtype
+        self.model.warmup_rotary_cache(self.context_length, device=device, dtype=dtype)
+
+    def on_fit_start(self) -> None:
+        super().on_fit_start()
+        self._warmup_rotary_cache()
+
+    def on_validation_start(self) -> None:
+        super().on_validation_start()
+        self._warmup_rotary_cache()
+
+    def on_test_start(self) -> None:
+        super().on_test_start()
+        self._warmup_rotary_cache()
 
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         input_ids = batch["input_ids"]
@@ -201,14 +225,36 @@ class AutoregressiveLLMModule(pl.LightningModule):
             tokens = tokenizer(prompt, return_tensors="pt")
             input_ids = tokens["input_ids"].to(device)
             attention_mask = tokens["attention_mask"].to(device)
-            for _ in range(max_new_tokens):
-                logits = self.model(input_ids, padding_mask=attention_mask)
-                next_token_logits = logits[:, -1, :]
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-                input_ids = torch.cat([input_ids, next_token], dim=-1)
-                next_mask = torch.ones_like(next_token)
-                attention_mask = torch.cat([attention_mask, next_mask], dim=-1)
-            text = tokenizer.batch_decode(input_ids, skip_special_tokens=True)[0]
+            prompt_len = input_ids.size(1)
+            total_len = self.context_length
+            if prompt_len >= total_len:
+                raise ValueError(
+                    f"Prompt is too long for the configured context window ({self.context_length}). "
+                    "Increase block_size to generate from this prompt."
+                )
+            available_steps = total_len - prompt_len
+            steps_to_generate = min(max_new_tokens, available_steps)
+            # Warm up the rotary cache for the current device/dtype combo before decoding.
+            self.model.warmup_rotary_cache(self.context_length, device=device, dtype=next(self.parameters()).dtype)
+            batch_size = input_ids.size(0)
+            padded_input = torch.full(
+                (batch_size, total_len),
+                fill_value=self.pad_token_id,
+                dtype=input_ids.dtype,
+                device=device,
+            )
+            padded_mask = torch.zeros((batch_size, total_len), dtype=attention_mask.dtype, device=device)
+            padded_input[:, :prompt_len] = input_ids
+            padded_mask[:, :prompt_len] = attention_mask
+            current_length = prompt_len
+            for _ in range(steps_to_generate):
+                logits = self.model(padded_input, padding_mask=padded_mask)
+                next_token_logits = logits[:, current_length - 1, :]
+                next_token = torch.argmax(next_token_logits, dim=-1)
+                padded_input[:, current_length] = next_token
+                padded_mask[:, current_length] = 1
+                current_length += 1
+            text = tokenizer.batch_decode(padded_input[:, :current_length], skip_special_tokens=True)[0]
         return text
 
 
@@ -255,9 +301,10 @@ def main() -> None:
         pad_token_id=data_module.pad_token_id,
         step_size=args.step_size,
         initial_velocity=args.initial_velocity,
+        context_length=args.block_size,
     )
 
-    trainer = pl.Trainer(max_epochs=args.epochs, log_every_n_steps=1, enable_checkpointing=False)
+    trainer = pl.Trainer(max_epochs=args.epochs, log_every_n_steps=1, enable_checkpointing=False, precision="bf16")
     trainer.fit(module, datamodule=data_module)
     val_metrics = trainer.validate(module, datamodule=data_module)
 

@@ -39,6 +39,25 @@ class RotaryEmbedding(nn.Module):
         self._cache_dtype: Optional[torch.dtype] = None
         self._cache_device: Optional[torch.device] = None
 
+    def warmup_cache(
+        self,
+        seq_len: int,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        """
+        Pre-compute cached cos/sin tensors so that the training loop always takes the static fast-path.
+        """
+        if seq_len <= 0:
+            raise ValueError("seq_len must be positive when warming up the rotary cache.")
+        device = device or self.inv_freq.device
+        dtype = dtype or self.inv_freq.dtype
+        if seq_len > self.max_cached_len:
+            self.max_cached_len = seq_len
+        with torch.no_grad():
+            self.forward(seq_len, device=device, dtype=dtype)
+
     def forward(
         self, seq_len: int, *, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None
     ) -> tuple[Tensor, Tensor]:
@@ -345,6 +364,12 @@ class SecondOrderTransformerStack(nn.Module):
         self.layer_time_embed = nn.Parameter(torch.zeros(depth, embed_dim))
         self.layer_time_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
 
+    def warmup_rotary_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> None:
+        """
+        Make sure the rotary embeddings run in cached mode once training starts.
+        """
+        self.layer.attention.rotary.warmup_cache(seq_len, device=device, dtype=dtype)
+
     def forward(
         self,
         x: Tensor,
@@ -406,6 +431,9 @@ class LLM(nn.Module):
             initial_velocity=initial_velocity,
         )
         self.final_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps) if final_layer_norm else None
+
+    def warmup_rotary_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> None:
+        self.backbone.warmup_rotary_cache(seq_len, device=device, dtype=dtype)
 
     def _build_attention_mask(self, padding_mask: Optional[Tensor], seq_len: int, device: torch.device) -> Tensor:
         padding = _build_padding_attention_mask(padding_mask, seq_len, device)
