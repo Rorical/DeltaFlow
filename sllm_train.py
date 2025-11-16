@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import math
 import os
 from dataclasses import dataclass
@@ -27,6 +26,30 @@ class DataConfig:
     block_size: int = 128
     batch_size: int = 2
     num_workers: int = 0
+
+
+@dataclass
+class TrainConfig:
+    epochs: int = 1
+    embed_dim: int = 256
+    depth: int = 4
+    num_heads: int = 8
+    ff_hidden_dim: Optional[int] = None
+    lr: float = 3e-4
+    weight_decay: float = 0.01
+    warmup_steps: int = 200
+    min_lr: float = 1e-5
+    batch_size: int = 2
+    block_size: int = 128
+    num_workers: int = 0
+    max_new_tokens: int = 50
+    prompt: str = "Once upon a time"
+    step_size: float = 1.0
+    initial_velocity: str = "linear"
+    dataset_name: str = "wikitext"
+    dataset_config: str = "wikitext-2-raw-v1"
+    tokenizer_name: str = "gpt2"
+    seed: int = 42
 
 
 def _tokenize_batch(examples: Dict[str, List[str]], tokenizer: AutoTokenizer) -> Dict[str, Any]:
@@ -299,37 +322,18 @@ class AutoregressiveLLMModule(pl.LightningModule):
         return text
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train second-order LLM on WikiText using PyTorch Lightning")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--embed-dim", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=4)
-    parser.add_argument("--num-heads", type=int, default=8)
-    parser.add_argument("--ff-hidden-dim", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-steps", type=int, default=200)
-    parser.add_argument("--min-lr", type=float, default=1e-5)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--block-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--max-new-tokens", type=int, default=50)
-    parser.add_argument("--prompt", type=str, default="Once upon a time")
-    parser.add_argument("--step-size", type=float, default=1.0, help="Integration step size for each residual layer.")
-    parser.add_argument(
-        "--initial-velocity",
-        choices=["linear", "zero"],
-        default="linear",
-        help="Strategy for initializing the velocity state.",
-    )
-    return parser.parse_args()
-
-
 def main() -> None:
-    args = parse_args()
+    train_cfg = TrainConfig()
 
-    pl.seed_everything(42, workers=True)
-    data_cfg = DataConfig(batch_size=args.batch_size, block_size=args.block_size, num_workers=args.num_workers)
+    pl.seed_everything(train_cfg.seed, workers=True)
+    data_cfg = DataConfig(
+        dataset_name=train_cfg.dataset_name,
+        dataset_config=train_cfg.dataset_config,
+        tokenizer_name=train_cfg.tokenizer_name,
+        block_size=train_cfg.block_size,
+        batch_size=train_cfg.batch_size,
+        num_workers=train_cfg.num_workers,
+    )
     data_module = WikiTextDataModule(data_cfg)
     data_module.setup()
 
@@ -337,21 +341,26 @@ def main() -> None:
 
     module = AutoregressiveLLMModule(
         vocab_size=vocab_size,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        ff_hidden_dim=args.ff_hidden_dim,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+        embed_dim=train_cfg.embed_dim,
+        depth=train_cfg.depth,
+        num_heads=train_cfg.num_heads,
+        ff_hidden_dim=train_cfg.ff_hidden_dim,
+        lr=train_cfg.lr,
+        weight_decay=train_cfg.weight_decay,
         pad_token_id=data_module.pad_token_id,
-        step_size=args.step_size,
-        initial_velocity=args.initial_velocity,
-        context_length=args.block_size,
-        warmup_steps=args.warmup_steps,
-        min_lr=args.min_lr,
+        step_size=train_cfg.step_size,
+        initial_velocity=train_cfg.initial_velocity,
+        context_length=train_cfg.block_size,
+        warmup_steps=train_cfg.warmup_steps,
+        min_lr=train_cfg.min_lr,
     )
 
-    trainer = pl.Trainer(max_epochs=args.epochs, log_every_n_steps=1, enable_checkpointing=False, precision="bf16")
+    trainer = pl.Trainer(
+        max_epochs=train_cfg.epochs,
+        log_every_n_steps=1,
+        enable_checkpointing=False,
+        precision="bf16",
+    )
     trainer.fit(module, datamodule=data_module)
     val_metrics = trainer.validate(module, datamodule=data_module)
 
@@ -363,7 +372,11 @@ def main() -> None:
         else:
             print("Validation metrics unavailable or non-finite.")
 
-    generated = module.generate(data_module.tokenizer, args.prompt, max_new_tokens=args.max_new_tokens)
+    generated = module.generate(
+        data_module.tokenizer,
+        train_cfg.prompt,
+        max_new_tokens=train_cfg.max_new_tokens,
+    )
     print("=== Sampled Text ===")
     print(generated)
 
