@@ -217,35 +217,10 @@ class FeedForward(nn.Module):
         return self.w3(gated)
 
 
-def _layer_time_embeddings(depth: int, embed_dim: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-    """
-    Build smooth 0-1 normalized time embeddings for each layer, similar to diffusion step embeddings.
-    """
-    if depth <= 0:
-        raise ValueError("depth must be a positive integer.")
-    if depth == 1:
-        steps = torch.zeros(1, device=device, dtype=dtype)
-    else:
-        steps = torch.linspace(0.0, 1.0, steps=depth, device=device, dtype=dtype)
-
-    half_dim = embed_dim // 2
-    if half_dim == 0:
-        return steps.view(depth, 1).expand(depth, embed_dim)
-
-    # Match diffusion-style sinusoidal timestep embeddings.
-    freq_div = max(half_dim - 1, 1)
-    freq = torch.exp(-math.log(10000.0) * torch.arange(half_dim, device=device, dtype=dtype) / freq_div)
-    angles = steps[:, None] * freq[None, :]
-    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-    if emb.size(-1) < embed_dim:
-        emb = F.pad(emb, (0, embed_dim - emb.size(-1)))
-    return emb
-
-
 class SecondOrderTransformerLayer(nn.Module):
     """
-    Implements a single second-order residual step following the formulation in
-    second_order_resnet_math.md. Each step keeps track of position x and velocity v.
+    Implements a single second-order residual step.
+    Each step keeps track of position x and velocity v.
     """
 
     def __init__(
@@ -263,8 +238,10 @@ class SecondOrderTransformerLayer(nn.Module):
         super().__init__()
         if step_size <= 0:
             raise ValueError("step_size must be positive for stable second-order updates.")
-        self.state_fuse = nn.Linear(2 * embed_dim, embed_dim, bias=bias)
-        self.state_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.attn_state_fuse = nn.Linear(2 * embed_dim, embed_dim, bias=bias)
+        self.ffn_state_fuse = nn.Linear(2 * embed_dim, embed_dim, bias=bias)
+        self.attn_state_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.ffn_state_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         self.accel_norm1 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         self.accel_norm2 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         self.attention = SelfAttention(
@@ -280,10 +257,15 @@ class SecondOrderTransformerLayer(nn.Module):
         # Learnable log step so that actual step stays positive while layers share structure.
         self.log_step = nn.Parameter(torch.log(torch.tensor(float(step_size), dtype=torch.float32)))
 
-    def _fused_state(self, x: Tensor, v: Tensor) -> Tensor:
+    def _attn_state(self, x: Tensor, v: Tensor) -> Tensor:
         fused = torch.cat((x, v), dim=-1)
-        fused = self.state_fuse(fused)
-        return self.state_norm(fused)
+        fused = self.attn_state_fuse(fused)
+        return self.attn_state_norm(fused)
+
+    def _ffn_state(self, x: Tensor, v: Tensor) -> Tensor:
+        fused = torch.cat((x, v), dim=-1)
+        fused = self.ffn_state_fuse(fused)
+        return self.ffn_state_norm(fused)
 
     def forward(
         self,
@@ -302,7 +284,7 @@ class SecondOrderTransformerLayer(nn.Module):
         step = torch.exp(self.log_step)
 
         # First update: attention predicts acceleration.
-        fused = self._fused_state(x, v)
+        fused = self._attn_state(x, v)
         if layer_embedding is not None:
             fused = fused + layer_embedding
         attn_in = self.accel_norm1(fused)
@@ -311,7 +293,7 @@ class SecondOrderTransformerLayer(nn.Module):
         x = x + step * v
 
         # Second update: feed-forward predicts acceleration.
-        fused = self._fused_state(x, v)
+        fused = self._ffn_state(x, v)
         if layer_embedding is not None:
             fused = fused + layer_embedding
         ff_in = self.accel_norm2(fused)
@@ -360,6 +342,8 @@ class SecondOrderTransformerStack(nn.Module):
         self.initial_velocity = initial_velocity
         self.velocity_proj = nn.Linear(embed_dim, embed_dim, bias=bias) if initial_velocity == "linear" else None
         self.embed_dim = embed_dim
+        self.layer_time_embed = nn.Parameter(torch.zeros(depth, embed_dim))
+        self.layer_time_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
 
     def forward(
         self,
@@ -372,9 +356,9 @@ class SecondOrderTransformerStack(nn.Module):
         else:
             v = self.velocity_proj(x)
 
-        embeddings = _layer_time_embeddings(self.depth, self.embed_dim, x.device, x.dtype)
         for idx in range(self.depth):
-            layer_embed = embeddings[idx].view(1, 1, -1)
+            layer_embed = self.layer_time_norm(self.layer_time_embed[idx])
+            layer_embed = layer_embed.to(dtype=x.dtype, device=x.device).view(1, 1, -1)
             x, v = self.layer(x, v, mask=mask, layer_embedding=layer_embed)
 
         if return_velocity:
