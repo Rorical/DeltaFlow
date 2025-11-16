@@ -23,7 +23,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 @dataclass
 class TrainConfig:
-    epochs: int = 1
+    epochs: int = 20
     embed_dim: int = 768
     depth: int = 12
     num_heads: int = 12
@@ -35,7 +35,8 @@ class TrainConfig:
     min_lr: float = 1e-5
     batch_size: int = 4
     block_size: int = 1024
-    num_workers: int = 0
+    num_workers: int = 4
+    prefetch_factor: Optional[int] = 2
     max_new_tokens: int = 50
     prompt: str = "Once upon a time"
     step_size: float = 1.0
@@ -98,17 +99,19 @@ class WikiTextDataModule(pl.LightningDataModule):
             batched=True,
             remove_columns=raw_datasets["train"].column_names,
             fn_kwargs={"tokenizer": self.tokenizer},
-            load_from_cache_file=False,
+            load_from_cache_file=True,
         )
 
         lm_datasets = tokenized.map(
             _group_texts,
             batched=True,
             fn_kwargs={"block_size": self.cfg.block_size},
+            load_from_cache_file=True,
         )
         lm_datasets = lm_datasets.filter(
             _filter_block_size,
             fn_kwargs={"block_size": self.cfg.block_size},
+            load_from_cache_file=True,
         )
 
         split = lm_datasets["train"].train_test_split(test_size=0.05, seed=42)
@@ -124,38 +127,27 @@ class WikiTextDataModule(pl.LightningDataModule):
         attention_mask = torch.tensor([example["attention_mask"] for example in examples], dtype=torch.long)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
+    def _build_loader(self, dataset, *, shuffle: bool) -> DataLoader:
+        loader_kwargs = {
+            "batch_size": self.cfg.batch_size,
+            "shuffle": shuffle,
+            "num_workers": self.cfg.num_workers,
+            "collate_fn": self.collate_fn,
+            "persistent_workers": self.cfg.num_workers > 0,
+            "drop_last": True,
+        }
+        if self.cfg.num_workers > 0 and self.cfg.prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = self.cfg.prefetch_factor
+        return DataLoader(dataset, **loader_kwargs)
+
     def train_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self.dataset["train"],
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
-            num_workers=self.cfg.num_workers,
-            collate_fn=self.collate_fn,
-            persistent_workers=self.cfg.num_workers > 0,
-            drop_last=True,
-        )
+        return self._build_loader(self.dataset["train"], shuffle=True)
 
     def val_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self.dataset["validation"],
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-            collate_fn=self.collate_fn,
-            persistent_workers=self.cfg.num_workers > 0,
-            drop_last=True,
-        )
+        return self._build_loader(self.dataset["validation"], shuffle=False)
 
     def test_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self.dataset["eval"],
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-            collate_fn=self.collate_fn,
-            persistent_workers=self.cfg.num_workers > 0,
-            drop_last=True,
-        )
+        return self._build_loader(self.dataset["eval"], shuffle=False)
 
 
 class AutoregressiveLLMModule(pl.LightningModule):

@@ -198,20 +198,33 @@ class SelfAttention(nn.Module):
         cos, sin = self.rotary(seq_len, device=x.device, dtype=q.dtype)
         q, k = _apply_rotary_pos_emb(q, k, cos, sin, self.rotary_dim)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
-
         if mask is not None:
             if mask.dtype != torch.bool:
                 mask = mask != 0
             if mask.dim() == 2:
                 mask = mask[:, None, None, :]
-            scores = scores.masked_fill(~mask, float("-inf"))
 
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
+        if hasattr(F, "scaled_dot_product_attention"):
+            dropout_p = self.dropout.p if self.training else 0.0
+            context = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+            )
+        else:
+            scale = 1.0 / math.sqrt(self.head_dim)
+            scores = torch.matmul(q, k.transpose(-1, -2)) * scale
 
-        context = torch.matmul(attn, v)
+            if mask is not None:
+                scores = scores.masked_fill(~mask, float("-inf"))
+
+            attn = F.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
+            context = torch.matmul(attn, v)
+
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
         output = self.out_proj(context)
         return output
