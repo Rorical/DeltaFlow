@@ -45,7 +45,7 @@ class TrainConfig:
     tokenizer_name: str = "gpt2"
     seed: int = 42
     grad_clip_norm: float = 1.0
-    precision: str = "bf16"
+    precision: str = "bf16-true"
     log_every_n_steps: int = 1
     use_autocast: bool = True
     autocast_device_type: Optional[str] = None
