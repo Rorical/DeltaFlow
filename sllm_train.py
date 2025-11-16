@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LambdaLR
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -144,10 +145,13 @@ class AutoregressiveLLMModule(pl.LightningModule):
         num_heads: int,
         ff_hidden_dim: Optional[int],
         lr: float,
+        weight_decay: float,
         pad_token_id: int,
         step_size: float,
         initial_velocity: str,
         context_length: int,
+        warmup_steps: int,
+        min_lr: float,
     ):
         super().__init__()
         if context_length <= 0:
@@ -162,16 +166,53 @@ class AutoregressiveLLMModule(pl.LightningModule):
             initial_velocity=initial_velocity,
         )
         self.lr = lr
+        self.weight_decay = weight_decay
         self.pad_token_id = pad_token_id
         self.context_length = context_length
+        self.warmup_steps = max(0, warmup_steps)
+        self.min_lr = max(0.0, min_lr)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        scheduler = self._build_scheduler(optimizer)
+        if scheduler is None:
+            return optimizer
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+                "name": "cosine_warmup",
+            },
+        }
 
     def _warmup_rotary_cache(self) -> None:
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
         self.model.warmup_rotary_cache(self.context_length, device=device, dtype=dtype)
+
+    def _build_scheduler(self, optimizer: torch.optim.Optimizer) -> Optional[LambdaLR]:
+        total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
+        if total_steps is None or total_steps <= 0:
+            return None
+        if total_steps == 1:
+            return None
+        warmup_steps = min(self.warmup_steps, total_steps - 1)
+        decay_steps = max(1, total_steps - warmup_steps)
+        base_lr = self.lr
+        min_lr_factor = self.min_lr / base_lr if base_lr > 0 else 0.0
+        min_lr_factor = min(max(min_lr_factor, 0.0), 1.0)
+
+        def lr_lambda(current_step: int) -> float:
+            if warmup_steps > 0 and current_step < warmup_steps:
+                return float(current_step + 1) / float(warmup_steps)
+            progress = float(current_step - warmup_steps) / float(decay_steps)
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return (cosine * (1.0 - min_lr_factor)) + min_lr_factor
+
+        return LambdaLR(optimizer, lr_lambda)
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
@@ -266,6 +307,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--ff-hidden-dim", type=int, default=None)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -298,10 +342,13 @@ def main() -> None:
         num_heads=args.num_heads,
         ff_hidden_dim=args.ff_hidden_dim,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         pad_token_id=data_module.pad_token_id,
         step_size=args.step_size,
         initial_velocity=args.initial_velocity,
         context_length=args.block_size,
+        warmup_steps=args.warmup_steps,
+        min_lr=args.min_lr,
     )
 
     trainer = pl.Trainer(max_epochs=args.epochs, log_every_n_steps=1, enable_checkpointing=False, precision="bf16")
