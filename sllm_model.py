@@ -417,7 +417,7 @@ class LLM(nn.Module):
             raise ValueError("vocab_size must be a positive integer.")
 
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.output_projection = nn.Linear(embed_dim, vocab_size, bias=True)
+        self.output_projection = nn.Linear(embed_dim, vocab_size, bias=False)
         self.backbone = SecondOrderTransformerStack(
             depth=depth,
             embed_dim=embed_dim,
@@ -431,9 +431,16 @@ class LLM(nn.Module):
             initial_velocity=initial_velocity,
         )
         self.final_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps) if final_layer_norm else None
+        self._tie_embedding_weights()
 
     def warmup_rotary_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> None:
         self.backbone.warmup_rotary_cache(seq_len, device=device, dtype=dtype)
+
+    def _tie_embedding_weights(self) -> None:
+        """
+        Share weights between the token embedding table and the LM head to keep representations aligned.
+        """
+        self.output_projection.weight = self.token_embedding.weight
 
     def _build_attention_mask(self, padding_mask: Optional[Tensor], seq_len: int, device: torch.device) -> Tensor:
         padding = _build_padding_attention_mask(padding_mask, seq_len, device)
