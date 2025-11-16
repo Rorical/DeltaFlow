@@ -4,6 +4,7 @@ import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +15,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from sllm_model import LLM
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -35,7 +37,8 @@ class TrainConfig:
     depth: int = 4
     num_heads: int = 8
     ff_hidden_dim: Optional[int] = None
-    lr: float = 3e-4
+    base_lr: float = 3e-4
+    lr_scale_reference_batch: int = 2
     weight_decay: float = 0.01
     warmup_steps: int = 200
     min_lr: float = 1e-5
@@ -50,6 +53,12 @@ class TrainConfig:
     dataset_config: str = "wikitext-2-raw-v1"
     tokenizer_name: str = "gpt2"
     seed: int = 42
+    grad_clip_norm: float = 1.0
+    precision: str = "bf16"
+    log_every_n_steps: int = 1
+    use_autocast: bool = True
+    autocast_device_type: Optional[str] = None
+    autocast_dtype: Optional[str] = None
 
 
 def _tokenize_batch(examples: Dict[str, List[str]], tokenizer: AutoTokenizer) -> Dict[str, Any]:
@@ -175,6 +184,13 @@ class AutoregressiveLLMModule(pl.LightningModule):
         context_length: int,
         warmup_steps: int,
         min_lr: float,
+        tokenizer: Optional[AutoTokenizer],
+        sample_prompt: str,
+        sample_max_new_tokens: int,
+        precision_mode: str,
+        use_autocast: bool,
+        autocast_device_type: Optional[str],
+        autocast_dtype: Optional[str],
     ):
         super().__init__()
         if context_length <= 0:
@@ -194,6 +210,13 @@ class AutoregressiveLLMModule(pl.LightningModule):
         self.context_length = context_length
         self.warmup_steps = max(0, warmup_steps)
         self.min_lr = max(0.0, min_lr)
+        self.sample_tokenizer = tokenizer
+        self.sample_prompt = sample_prompt
+        self.sample_max_new_tokens = sample_max_new_tokens
+        self.precision_mode = precision_mode.lower()
+        self.autocast_enabled = use_autocast
+        self.autocast_device_type = autocast_device_type
+        self.autocast_dtype = self._resolve_autocast_dtype(autocast_dtype)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -209,6 +232,40 @@ class AutoregressiveLLMModule(pl.LightningModule):
                 "name": "cosine_warmup",
             },
         }
+
+    def _resolve_autocast_dtype(self, dtype_name: Optional[str]) -> Optional[torch.dtype]:
+        if dtype_name is None:
+            return None
+        name = dtype_name.lower()
+        mapping = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }
+        return mapping.get(name, None)
+
+    def _autocast_context(self):
+        if not self.autocast_enabled:
+            return nullcontext()
+        param = next(self.model.parameters(), None)
+        if param is None:
+            return nullcontext()
+        param_device = param.device
+        device_type = self.autocast_device_type or param_device.type
+        if device_type == "xla":
+            return nullcontext()
+        dtype = self.autocast_dtype
+        if dtype is None:
+            if "bf16" in self.precision_mode:
+                dtype = torch.bfloat16
+            elif "16" in self.precision_mode:
+                dtype = torch.float16
+            else:
+                dtype = torch.float32
+        return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
 
     def _warmup_rotary_cache(self) -> None:
         device = next(self.model.parameters()).device
@@ -256,13 +313,14 @@ class AutoregressiveLLMModule(pl.LightningModule):
         targets = input_ids[:, 1:]
         padding = attention_mask[:, :-1]
 
-        logits = self.model(inputs, padding_mask=padding)
-        vocab_size = logits.size(-1)
-        loss = F.cross_entropy(
-            logits.view(-1, vocab_size),
-            targets.reshape(-1),
-            ignore_index=self.pad_token_id,
-        )
+        with self._autocast_context():
+            logits = self.model(inputs, padding_mask=padding)
+            vocab_size = logits.size(-1)
+            loss = F.cross_entropy(
+                logits.view(-1, vocab_size),
+                targets.reshape(-1),
+                ignore_index=self.pad_token_id,
+            )
         self.log(
             f"{stage}_loss",
             loss,
@@ -282,44 +340,66 @@ class AutoregressiveLLMModule(pl.LightningModule):
         self.log("val_perplexity", perplexity, prog_bar=True, on_epoch=True, batch_size=batch["input_ids"].size(0))
         return loss
 
-    def generate(self, tokenizer: AutoTokenizer, prompt: str, max_new_tokens: int = 50) -> str:
-        self.eval()
-        device = next(self.parameters()).device
-        with torch.no_grad():
-            tokens = tokenizer(prompt, return_tensors="pt")
-            input_ids = tokens["input_ids"].to(device)
-            attention_mask = tokens["attention_mask"].to(device)
-            prompt_len = input_ids.size(1)
-            total_len = self.context_length
-            if prompt_len >= total_len:
-                raise ValueError(
-                    f"Prompt is too long for the configured context window ({self.context_length}). "
-                    "Increase block_size to generate from this prompt."
-                )
-            available_steps = total_len - prompt_len
-            steps_to_generate = min(max_new_tokens, available_steps)
-            # Warm up the rotary cache for the current device/dtype combo before decoding.
-            self.model.warmup_rotary_cache(self.context_length, device=device, dtype=next(self.parameters()).dtype)
-            batch_size = input_ids.size(0)
-            padded_input = torch.full(
-                (batch_size, total_len),
-                fill_value=self.pad_token_id,
-                dtype=input_ids.dtype,
-                device=device,
+    def on_validation_epoch_end(self) -> None:
+        super().on_validation_epoch_end()
+        if self.sample_tokenizer is None:
+            return
+        if self.trainer is not None and not self.trainer.is_global_zero:
+            return
+        try:
+            text = self.generate(
+                self.sample_tokenizer,
+                self.sample_prompt,
+                max_new_tokens=self.sample_max_new_tokens,
             )
-            padded_mask = torch.zeros((batch_size, total_len), dtype=attention_mask.dtype, device=device)
-            padded_input[:, :prompt_len] = input_ids
-            padded_mask[:, :prompt_len] = attention_mask
-            current_length = prompt_len
-            for _ in range(steps_to_generate):
-                logits = self.model(padded_input, padding_mask=padded_mask)
-                next_token_logits = logits[:, current_length - 1, :]
-                next_token = torch.argmax(next_token_logits, dim=-1)
-                padded_input[:, current_length] = next_token
-                padded_mask[:, current_length] = 1
-                current_length += 1
-            text = tokenizer.batch_decode(padded_input[:, :current_length], skip_special_tokens=True)[0]
-        return text
+        except ValueError as exc:
+            self.print(f"[generation skipped] {exc}")
+            return
+        self.print(f"=== Sampled Text (epoch {self.current_epoch}) ===\n{text}")
+
+    def generate(self, tokenizer: AutoTokenizer, prompt: str, max_new_tokens: int = 50) -> str:
+        was_training = self.training
+        try:
+            self.eval()
+            device = next(self.parameters()).device
+            with torch.no_grad():
+                tokens = tokenizer(prompt, return_tensors="pt")
+                input_ids = tokens["input_ids"].to(device)
+                attention_mask = tokens["attention_mask"].to(device)
+                prompt_len = input_ids.size(1)
+                total_len = self.context_length
+                if prompt_len >= total_len:
+                    raise ValueError(
+                        f"Prompt is too long for the configured context window ({self.context_length}). "
+                        "Increase block_size to generate from this prompt."
+                    )
+                available_steps = total_len - prompt_len
+                steps_to_generate = min(max_new_tokens, available_steps)
+                # Warm up the rotary cache for the current device/dtype combo before decoding.
+                self.model.warmup_rotary_cache(self.context_length, device=device, dtype=next(self.parameters()).dtype)
+                batch_size = input_ids.size(0)
+                padded_input = torch.full(
+                    (batch_size, total_len),
+                    fill_value=self.pad_token_id,
+                    dtype=input_ids.dtype,
+                    device=device,
+                )
+                padded_mask = torch.zeros((batch_size, total_len), dtype=attention_mask.dtype, device=device)
+                padded_input[:, :prompt_len] = input_ids
+                padded_mask[:, :prompt_len] = attention_mask
+                current_length = prompt_len
+                for _ in range(steps_to_generate):
+                    logits = self.model(padded_input, padding_mask=padded_mask)
+                    next_token_logits = logits[:, current_length - 1, :]
+                    next_token = torch.argmax(next_token_logits, dim=-1)
+                    padded_input[:, current_length] = next_token
+                    padded_mask[:, current_length] = 1
+                    current_length += 1
+                text = tokenizer.batch_decode(padded_input[:, :current_length], skip_special_tokens=True)[0]
+            return text
+        finally:
+            if was_training:
+                self.train()
 
 
 def main() -> None:
@@ -338,6 +418,11 @@ def main() -> None:
     data_module.setup()
 
     vocab_size = data_module.tokenizer.vocab_size
+    lr_scale = train_cfg.batch_size / max(1, train_cfg.lr_scale_reference_batch)
+    effective_lr = train_cfg.base_lr * lr_scale
+    effective_min_lr = train_cfg.min_lr * lr_scale
+    if effective_min_lr > effective_lr:
+        effective_min_lr = effective_lr
 
     module = AutoregressiveLLMModule(
         vocab_size=vocab_size,
@@ -345,21 +430,47 @@ def main() -> None:
         depth=train_cfg.depth,
         num_heads=train_cfg.num_heads,
         ff_hidden_dim=train_cfg.ff_hidden_dim,
-        lr=train_cfg.lr,
+        lr=effective_lr,
         weight_decay=train_cfg.weight_decay,
         pad_token_id=data_module.pad_token_id,
         step_size=train_cfg.step_size,
         initial_velocity=train_cfg.initial_velocity,
         context_length=train_cfg.block_size,
         warmup_steps=train_cfg.warmup_steps,
-        min_lr=train_cfg.min_lr,
+        min_lr=effective_min_lr,
+        tokenizer=data_module.tokenizer,
+        sample_prompt=train_cfg.prompt,
+        sample_max_new_tokens=train_cfg.max_new_tokens,
+        precision_mode=train_cfg.precision,
+        use_autocast=train_cfg.use_autocast,
+        autocast_device_type=train_cfg.autocast_device_type,
+        autocast_dtype=train_cfg.autocast_dtype,
     )
 
+    resume_checkpoint_cb = ModelCheckpoint(
+        save_last=True,
+        save_top_k=0,
+        every_n_epochs=1,
+        save_weights_only=False,
+        filename="resume",
+        auto_insert_metric_name=False,
+    )
+    best_model_cb = ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        every_n_epochs=1,
+        save_weights_only=True,
+        filename="best",
+        auto_insert_metric_name=False,
+    )
     trainer = pl.Trainer(
         max_epochs=train_cfg.epochs,
-        log_every_n_steps=1,
-        enable_checkpointing=False,
-        precision="bf16",
+        log_every_n_steps=train_cfg.log_every_n_steps,
+        callbacks=[resume_checkpoint_cb, best_model_cb],
+        precision=train_cfg.precision,
+        gradient_clip_val=train_cfg.grad_clip_norm,
+        gradient_clip_algorithm="norm",
     )
     trainer.fit(module, datamodule=data_module)
     val_metrics = trainer.validate(module, datamodule=data_module)
