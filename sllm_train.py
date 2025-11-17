@@ -26,17 +26,16 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 @dataclass
 class TrainConfig:
-    epochs: int = 20
-    embed_dim: int = 768
+    epochs: int = 50
+    embed_dim: int = 1728
     depth: int = 12
     num_heads: int = 12
-    ff_hidden_dim: Optional[int] = 3072
-    base_lr: float = 5e-4
-    lr_scale_reference_batch: int = 4
+    ff_hidden_dim: Optional[int] = 6912
+    base_lr: float = 2e-4
     weight_decay: float = 0.01
     warmup_steps: int = 200
     min_lr: float = 1e-5
-    batch_size: int = 16
+    batch_size: int = 12
     block_size: int = 1024
     num_workers: int = 4
     prefetch_factor: Optional[int] = 2
@@ -404,11 +403,6 @@ def main() -> None:
     data_module.setup()
 
     vocab_size = data_module.tokenizer.vocab_size
-    lr_scale = train_cfg.batch_size / max(1, train_cfg.lr_scale_reference_batch)
-    effective_lr = train_cfg.base_lr * lr_scale
-    effective_min_lr = train_cfg.min_lr * lr_scale
-    if effective_min_lr > effective_lr:
-        effective_min_lr = effective_lr
 
     module = AutoregressiveLLMModule(
         vocab_size=vocab_size,
@@ -416,14 +410,14 @@ def main() -> None:
         depth=train_cfg.depth,
         num_heads=train_cfg.num_heads,
         ff_hidden_dim=train_cfg.ff_hidden_dim,
-        lr=effective_lr,
+        lr=train_cfg.base_lr,
         weight_decay=train_cfg.weight_decay,
         pad_token_id=data_module.pad_token_id,
         step_size=train_cfg.step_size,
         initial_velocity=train_cfg.initial_velocity,
         context_length=train_cfg.block_size,
         warmup_steps=train_cfg.warmup_steps,
-        min_lr=effective_min_lr,
+        min_lr=train_cfg.min_lr,
         tokenizer=data_module.tokenizer,
         sample_prompt=train_cfg.prompt,
         sample_max_new_tokens=train_cfg.max_new_tokens,

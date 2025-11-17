@@ -155,7 +155,6 @@ class SelfAttention(nn.Module):
         num_heads: int,
         *,
         rotary_dim: Optional[int] = None,
-        dropout: float = 0.0,
         bias: bool = True,
     ):
         super().__init__()
@@ -259,8 +258,8 @@ class SecondOrderTransformerLayer(nn.Module):
         super().__init__()
         if step_size <= 0:
             raise ValueError("step_size must be positive for stable second-order updates.")
-        self.attn_state_fuse = nn.Linear(2 * embed_dim, embed_dim, bias=bias)
-        self.ffn_state_fuse = nn.Linear(2 * embed_dim, embed_dim, bias=bias)
+        self.attn_gate = nn.Parameter(torch.zeros(embed_dim))
+        self.ffn_gate = nn.Parameter(torch.zeros(embed_dim))
         self.attn_state_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         self.ffn_state_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         self.accel_norm1 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
@@ -269,7 +268,6 @@ class SecondOrderTransformerLayer(nn.Module):
             embed_dim=embed_dim,
             num_heads=num_heads,
             rotary_dim=rotary_dim,
-            dropout=dropout,
             bias=bias,
         )
         self.feed_forward = FeedForward(embed_dim, hidden_dim=ff_hidden_dim, bias=bias)
@@ -277,16 +275,24 @@ class SecondOrderTransformerLayer(nn.Module):
         self.ff_dropout = nn.Dropout(dropout)
         # Learnable log step so that actual step stays positive while layers share structure.
         self.log_step = nn.Parameter(torch.log(torch.tensor(float(step_size), dtype=torch.float32)))
+        self._min_log_step = math.log(1e-3)
+        self._max_log_step = math.log(2.0)
+
+    def _mix_state(self, x: Tensor, v: Tensor, gate_param: Tensor) -> Tensor:
+        gate = torch.sigmoid(gate_param)
+        return x + gate * v
 
     def _attn_state(self, x: Tensor, v: Tensor) -> Tensor:
-        fused = torch.cat((x, v), dim=-1)
-        fused = self.attn_state_fuse(fused)
+        fused = self._mix_state(x, v, self.attn_gate)
         return self.attn_state_norm(fused)
 
     def _ffn_state(self, x: Tensor, v: Tensor) -> Tensor:
-        fused = torch.cat((x, v), dim=-1)
-        fused = self.ffn_state_fuse(fused)
+        fused = self._mix_state(x, v, self.ffn_gate)
         return self.ffn_state_norm(fused)
+
+    def _stable_step(self) -> Tensor:
+        bounded_log_step = torch.clamp(self.log_step, min=self._min_log_step, max=self._max_log_step)
+        return torch.exp(bounded_log_step)
 
     def forward(
         self,
@@ -301,7 +307,7 @@ class SecondOrderTransformerLayer(nn.Module):
         Returns:
             Tuple of updated (x, v) after a second-order residual step.
         """
-        step = torch.exp(self.log_step)
+        step = self._stable_step()
 
         # First update: attention predicts acceleration.
         fused = self._attn_state(x, v)
