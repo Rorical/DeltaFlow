@@ -27,15 +27,15 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 @dataclass
 class TrainConfig:
     epochs: int = 3
-    embed_dim: int = 192
-    depth: int = 6
-    num_heads: int = 6
-    ff_hidden_dim: Optional[int] = 768
-    base_lr: float = 3e-4
-    weight_decay: float = 0.01
-    warmup_steps: int = 200
+    embed_dim: int = 512
+    depth: int = 12
+    num_heads: int = 8
+    ff_hidden_dim: Optional[int] = 2048
+    base_lr: float = 2e-4
+    weight_decay: float = 0.02
+    warmup_steps: int = 1000
     min_lr: float = 1e-5
-    batch_size: int = 8
+    batch_size: int = 16
     grad_accum_steps: int = 1
     block_size: int = 512
     num_workers: Optional[int] = None
@@ -45,11 +45,11 @@ class TrainConfig:
     step_size: float = 1.0
     initial_velocity: str = "linear"
     dataset_name: str = "wikitext"
-    dataset_config: str = "wikitext-2-raw-v1"
+    dataset_config: str = "wikitext-103-v1"
     tokenizer_name: str = "gpt2"
     train_subset_size: Optional[int] = None
-    val_subset_size: Optional[int] = 1024
-    test_subset_size: Optional[int] = 1024
+    val_subset_size: Optional[int] = 4096
+    test_subset_size: Optional[int] = 4096
     seed: int = 42
     grad_clip_norm: float = 1.0
     precision: str = "bf16-true"
