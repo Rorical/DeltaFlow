@@ -26,26 +26,30 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 @dataclass
 class TrainConfig:
-    epochs: int = 50
-    embed_dim: int = 1728
-    depth: int = 12
-    num_heads: int = 12
-    ff_hidden_dim: Optional[int] = 6912
-    base_lr: float = 2e-4
+    epochs: int = 3
+    embed_dim: int = 192
+    depth: int = 6
+    num_heads: int = 6
+    ff_hidden_dim: Optional[int] = 768
+    base_lr: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 200
     min_lr: float = 1e-5
-    batch_size: int = 12
-    block_size: int = 1024
-    num_workers: int = 4
+    batch_size: int = 8
+    grad_accum_steps: int = 1
+    block_size: int = 512
+    num_workers: Optional[int] = None
     prefetch_factor: Optional[int] = 2
-    max_new_tokens: int = 50
-    prompt: str = "Once upon a time"
+    max_new_tokens: int = 100
+    prompt: str = "What can I say? "
     step_size: float = 1.0
     initial_velocity: str = "linear"
     dataset_name: str = "wikitext"
-    dataset_config: str = "wikitext-103-v1"
+    dataset_config: str = "wikitext-2-raw-v1"
     tokenizer_name: str = "gpt2"
+    train_subset_size: Optional[int] = None
+    val_subset_size: Optional[int] = 1024
+    test_subset_size: Optional[int] = 1024
     seed: int = 42
     grad_clip_norm: float = 1.0
     precision: str = "bf16-true"
@@ -116,16 +120,32 @@ class WikiTextDataModule(pl.LightningDataModule):
             load_from_cache_file=True,
         )
 
-        split = lm_datasets["train"].train_test_split(test_size=0.05, seed=42)
-        val_dataset = lm_datasets["validation"]
-        test_dataset = lm_datasets.get("test", None)
+        train_dataset = lm_datasets["train"]
+        val_dataset = lm_datasets.get("validation")
+        test_dataset = lm_datasets.get("test")
+
+        if val_dataset is None:
+            raise RuntimeError("Validation split missing from dataset; please provide one for evaluation.")
         if test_dataset is None:
+            split = train_dataset.train_test_split(test_size=0.05, seed=self.cfg.seed)
+            train_dataset = split["train"]
             test_dataset = split["test"]
+
         self.dataset = {
-            "train": split["train"],
-            "validation": val_dataset,
-            "test": test_dataset,
+            "train": self._maybe_truncate(train_dataset, self.cfg.train_subset_size),
+            "validation": self._maybe_truncate(val_dataset, self.cfg.val_subset_size),
+            "test": self._maybe_truncate(test_dataset, self.cfg.test_subset_size),
         }
+
+    def _maybe_truncate(self, dataset, max_samples: Optional[int]):
+        if max_samples is None:
+            return dataset
+        max_samples = max(0, max_samples)
+        if max_samples == 0 or len(dataset) <= max_samples:
+            if max_samples == 0:
+                return dataset.select([])
+            return dataset
+        return dataset.select(list(range(max_samples)))
 
     def collate_fn(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         input_ids = torch.tensor([example["input_ids"] for example in examples], dtype=torch.long)
@@ -133,15 +153,21 @@ class WikiTextDataModule(pl.LightningDataModule):
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
     def _build_loader(self, dataset, *, shuffle: bool) -> DataLoader:
+        num_workers = self.cfg.num_workers
+        if num_workers is None:
+            try:
+                num_workers = min(8, os.cpu_count() or 1)
+            except NotImplementedError:
+                num_workers = 0
         loader_kwargs = {
             "batch_size": self.cfg.batch_size,
             "shuffle": shuffle,
-            "num_workers": self.cfg.num_workers,
+            "num_workers": num_workers,
             "collate_fn": self.collate_fn,
-            "persistent_workers": self.cfg.num_workers > 0,
+            "persistent_workers": num_workers > 0,
             "drop_last": True,
         }
-        if self.cfg.num_workers > 0 and self.cfg.prefetch_factor is not None:
+        if num_workers > 0 and self.cfg.prefetch_factor is not None:
             loader_kwargs["prefetch_factor"] = self.cfg.prefetch_factor
         return DataLoader(dataset, **loader_kwargs)
 
@@ -451,6 +477,7 @@ def main() -> None:
         precision=train_cfg.precision,
         gradient_clip_val=train_cfg.grad_clip_norm,
         gradient_clip_algorithm="norm",
+        accumulate_grad_batches=max(1, train_cfg.grad_accum_steps),
     )
     trainer.fit(module, datamodule=data_module)
     val_metrics = trainer.validate(module, datamodule=data_module)
