@@ -237,6 +237,109 @@ class FeedForward(nn.Module):
         return self.w3(gated)
 
 
+class SecondOrderSelfAttention(nn.Module):
+    """
+    Attention block that consumes position x and velocity v separately and predicts acceleration.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        *,
+        rotary_dim: Optional[int] = None,
+        dropout: float = 0.0,
+        bias: bool = True,
+    ):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads.")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.rotary_dim = rotary_dim or self.head_dim
+        if self.rotary_dim > self.head_dim:
+            raise ValueError("rotary_dim cannot exceed head_dim.")
+        if self.rotary_dim % 2 != 0:
+            raise ValueError("rotary_dim must be even.")
+
+        self.rotary = RotaryEmbedding(self.rotary_dim)
+        self.q_proj_x = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj_v = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj_x = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj_v = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj_x = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj_v = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def _shape(self, tensor: Tensor, seq_len: int, batch_size: int) -> Tensor:
+        return tensor.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, x: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """
+        Args:
+            x: Tensor of shape (batch, seq_len, embed_dim) with positions.
+            v: Tensor of shape (batch, seq_len, embed_dim) with velocities.
+        """
+        if x.shape != v.shape:
+            raise ValueError("x and v must have identical shapes for second-order attention.")
+        batch_size, seq_len, _ = x.shape
+        q = self.q_proj_x(x) + self.q_proj_v(v)
+        k = self.k_proj_x(x) + self.k_proj_v(v)
+        value = self.v_proj_x(x) + self.v_proj_v(v)
+
+        q = self._shape(q, seq_len, batch_size)
+        k = self._shape(k, seq_len, batch_size)
+        value = self._shape(value, seq_len, batch_size)
+
+        cos, sin = self.rotary(seq_len, device=x.device, dtype=q.dtype)
+        q, k = _apply_rotary_pos_emb(q, k, cos, sin, self.rotary_dim)
+
+        attn_mask = None
+        if mask is not None:
+            if mask.dtype != torch.bool:
+                mask = mask != 0
+            if mask.dim() == 2:
+                mask = mask[:, None, None, :]
+            attn_mask = mask
+
+        scale = 1.0 / math.sqrt(self.head_dim)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        if attn_mask is not None:
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
+
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+
+        context = torch.matmul(attn, value)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        return self.out_proj(context)
+
+
+class SecondOrderFeedForward(nn.Module):
+    """
+    Feed-forward network that consumes x and v independently and predicts acceleration.
+    """
+
+    def __init__(self, embed_dim: int, hidden_dim: Optional[int] = None, bias: bool = True):
+        super().__init__()
+        hidden_dim = hidden_dim or embed_dim * 4
+        self.w1_x = nn.Linear(embed_dim, hidden_dim, bias=bias)
+        self.w1_v = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.w2_x = nn.Linear(embed_dim, hidden_dim, bias=bias)
+        self.w2_v = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, embed_dim, bias=bias)
+
+    def forward(self, x: Tensor, v: Tensor) -> Tensor:
+        if x.shape != v.shape:
+            raise ValueError("x and v must have identical shapes for second-order feed-forward input.")
+        x_1 = self.w1_x(x) + self.w1_v(v)
+        x_2 = self.w2_x(x) + self.w2_v(v)
+        gated = F.silu(x_1) * x_2
+        return self.w3(gated)
+
+
 class SecondOrderTransformerLayer(nn.Module):
     """
     Implements a single second-order residual step.
@@ -258,37 +361,23 @@ class SecondOrderTransformerLayer(nn.Module):
         super().__init__()
         if step_size <= 0:
             raise ValueError("step_size must be positive for stable second-order updates.")
-        self.attn_gate = nn.Parameter(torch.zeros(embed_dim))
-        self.ffn_gate = nn.Parameter(torch.zeros(embed_dim))
-        self.attn_state_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
-        self.ffn_state_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
-        self.accel_norm1 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
-        self.accel_norm2 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
-        self.attention = SelfAttention(
+        self.attn_x_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.attn_v_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.ffn_x_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.ffn_v_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.attention = SecondOrderSelfAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
             rotary_dim=rotary_dim,
             bias=bias,
         )
-        self.feed_forward = FeedForward(embed_dim, hidden_dim=ff_hidden_dim, bias=bias)
+        self.feed_forward = SecondOrderFeedForward(embed_dim, hidden_dim=ff_hidden_dim, bias=bias)
         self.attn_dropout = nn.Dropout(dropout)
         self.ff_dropout = nn.Dropout(dropout)
         # Learnable log step so that actual step stays positive while layers share structure.
         self.log_step = nn.Parameter(torch.log(torch.tensor(float(step_size), dtype=torch.float32)))
         self._min_log_step = math.log(1e-3)
         self._max_log_step = math.log(2.0)
-
-    def _mix_state(self, x: Tensor, v: Tensor, gate_param: Tensor) -> Tensor:
-        gate = torch.sigmoid(gate_param)
-        return x + gate * v
-
-    def _attn_state(self, x: Tensor, v: Tensor) -> Tensor:
-        fused = self._mix_state(x, v, self.attn_gate)
-        return self.attn_state_norm(fused)
-
-    def _ffn_state(self, x: Tensor, v: Tensor) -> Tensor:
-        fused = self._mix_state(x, v, self.ffn_gate)
-        return self.ffn_state_norm(fused)
 
     def _stable_step(self) -> Tensor:
         bounded_log_step = torch.clamp(self.log_step, min=self._min_log_step, max=self._max_log_step)
@@ -310,16 +399,16 @@ class SecondOrderTransformerLayer(nn.Module):
         step = self._stable_step()
 
         # First update: attention predicts acceleration.
-        fused = self._attn_state(x, v)
-        attn_in = self.accel_norm1(fused)
-        accel_attn = self.attn_dropout(self.attention(attn_in, mask=mask))
+        attn_x = self.attn_x_norm(x)
+        attn_v = self.attn_v_norm(v)
+        accel_attn = self.attn_dropout(self.attention(attn_x, attn_v, mask=mask))
         v = v + step * accel_attn
         x = x + step * v
 
         # Second update: feed-forward predicts acceleration.
-        fused = self._ffn_state(x, v)
-        ff_in = self.accel_norm2(fused)
-        accel_ff = self.ff_dropout(self.feed_forward(ff_in))
+        ffn_x = self.ffn_x_norm(x)
+        ffn_v = self.ffn_v_norm(v)
+        accel_ff = self.ff_dropout(self.feed_forward(ffn_x, ffn_v))
         v = v + step * accel_ff
         x = x + step * v
 
