@@ -21,6 +21,10 @@ try:
 except ModuleNotFoundError:
     pass
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Kaggle TPUs export TPU_PROCESS_ADDRESSES=local, but torch_xla expects either
+# an empty value or one entry per TPU slice. Drop the placeholder to unblock PJRT.
+if os.environ.get("TPU_PROCESS_ADDRESSES") == "local":
+    os.environ.pop("TPU_PROCESS_ADDRESSES", None)
 
 
 @dataclass
