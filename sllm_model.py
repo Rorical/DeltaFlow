@@ -436,6 +436,7 @@ class LLM(nn.Module):
             initial_velocity=initial_velocity,
         )
         self.final_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps) if final_layer_norm else None
+        self._reset_parameters()
         self._tie_embedding_weights()
 
     def warmup_rotary_cache(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> None:
@@ -446,6 +447,10 @@ class LLM(nn.Module):
         Share weights between the token embedding table and the LM head to keep representations aligned.
         """
         self.output_projection.weight = self.token_embedding.weight
+
+    def _reset_parameters(self) -> None:
+        std = 0.02
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=std)
 
     def _build_attention_mask(self, padding_mask: Optional[Tensor], seq_len: int, device: torch.device) -> Tensor:
         padding = _build_padding_attention_mask(padding_mask, seq_len, device)

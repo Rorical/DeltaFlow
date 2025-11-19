@@ -9,7 +9,6 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import LambdaLR
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -26,22 +25,20 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 @dataclass
 class TrainConfig:
-    epochs: int = 3
+    epochs: int = 20
     embed_dim: int = 512
     depth: int = 12
     num_heads: int = 8
     ff_hidden_dim: Optional[int] = 2048
     base_lr: float = 2e-4
     weight_decay: float = 0.02
-    warmup_steps: int = 1000
-    min_lr: float = 1e-5
     batch_size: int = 16
     grad_accum_steps: int = 1
     block_size: int = 512
     num_workers: Optional[int] = None
     prefetch_factor: Optional[int] = 2
     max_new_tokens: int = 100
-    prompt: str = "What can I say? "
+    prompt: str = "What is your dream? My dream is"
     step_size: float = 1.0
     initial_velocity: str = "linear"
     dataset_name: str = "wikitext"
@@ -51,12 +48,14 @@ class TrainConfig:
     val_subset_size: Optional[int] = 4096
     test_subset_size: Optional[int] = 4096
     seed: int = 42
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 5.0
     precision: str = "bf16-true"
     log_every_n_steps: int = 1
     use_autocast: bool = True
     autocast_device_type: Optional[str] = None
     autocast_dtype: Optional[str] = None
+    auto_resume: bool = False
+    resume_checkpoint_name: str = "resume.ckpt"
 
 
 def _tokenize_batch(examples: Dict[str, List[str]], tokenizer: AutoTokenizer) -> Dict[str, Any]:
@@ -196,8 +195,6 @@ class AutoregressiveLLMModule(pl.LightningModule):
         step_size: float,
         initial_velocity: str,
         context_length: int,
-        warmup_steps: int,
-        min_lr: float,
         tokenizer: Optional[AutoTokenizer],
         sample_prompt: str,
         sample_max_new_tokens: int,
@@ -222,8 +219,6 @@ class AutoregressiveLLMModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.pad_token_id = pad_token_id
         self.context_length = context_length
-        self.warmup_steps = max(0, warmup_steps)
-        self.min_lr = max(0.0, min_lr)
         self.sample_tokenizer = tokenizer
         self.sample_prompt = sample_prompt
         self.sample_max_new_tokens = sample_max_new_tokens
@@ -233,19 +228,7 @@ class AutoregressiveLLMModule(pl.LightningModule):
         self.autocast_dtype = self._resolve_autocast_dtype(autocast_dtype)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        scheduler = self._build_scheduler(optimizer)
-        if scheduler is None:
-            return optimizer
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-                "name": "cosine_warmup",
-            },
-        }
+        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
     def _resolve_autocast_dtype(self, dtype_name: Optional[str]) -> Optional[torch.dtype]:
         if dtype_name is None:
@@ -285,28 +268,6 @@ class AutoregressiveLLMModule(pl.LightningModule):
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
         self.model.warmup_rotary_cache(self.context_length, device=device, dtype=dtype)
-
-    def _build_scheduler(self, optimizer: torch.optim.Optimizer) -> Optional[LambdaLR]:
-        total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
-        if total_steps is None or total_steps <= 0:
-            return None
-        if total_steps == 1:
-            return None
-        warmup_steps = min(self.warmup_steps, total_steps - 1)
-        decay_steps = max(1, total_steps - warmup_steps)
-        base_lr = self.lr
-        min_lr_factor = self.min_lr / base_lr if base_lr > 0 else 0.0
-        min_lr_factor = min(max(min_lr_factor, 0.0), 1.0)
-
-        def lr_lambda(current_step: int) -> float:
-            if warmup_steps > 0 and current_step < warmup_steps:
-                return float(current_step + 1) / float(warmup_steps)
-            progress = float(current_step - warmup_steps) / float(decay_steps)
-            progress = min(max(progress, 0.0), 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return (cosine * (1.0 - min_lr_factor)) + min_lr_factor
-
-        return LambdaLR(optimizer, lr_lambda)
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
@@ -442,8 +403,6 @@ def main() -> None:
         step_size=train_cfg.step_size,
         initial_velocity=train_cfg.initial_velocity,
         context_length=train_cfg.block_size,
-        warmup_steps=train_cfg.warmup_steps,
-        min_lr=train_cfg.min_lr,
         tokenizer=data_module.tokenizer,
         sample_prompt=train_cfg.prompt,
         sample_max_new_tokens=train_cfg.max_new_tokens,
@@ -479,7 +438,16 @@ def main() -> None:
         gradient_clip_algorithm="norm",
         accumulate_grad_batches=max(1, train_cfg.grad_accum_steps),
     )
-    trainer.fit(module, datamodule=data_module)
+    ckpt_path = None
+    if train_cfg.auto_resume:
+        ckpt_candidate = os.path.join(os.getcwd(), train_cfg.resume_checkpoint_name)
+        if os.path.exists(ckpt_candidate):
+            ckpt_path = ckpt_candidate
+            print(f"[auto-resume] Loading checkpoint from {ckpt_path}")
+        else:
+            print(f"[auto-resume] No checkpoint found at {ckpt_candidate}, starting fresh.")
+
+    trainer.fit(module, datamodule=data_module, ckpt_path=ckpt_path)
     val_metrics = trainer.validate(module, datamodule=data_module)
 
     if val_metrics:
