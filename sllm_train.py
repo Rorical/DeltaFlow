@@ -26,10 +26,10 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 @dataclass
 class TrainConfig:
     epochs: int = 20
-    embed_dim: int = 512
+    embed_dim: int = 400
     depth: int = 12
     num_heads: int = 8
-    ff_hidden_dim: Optional[int] = 2048
+    ff_hidden_dim: Optional[int] = 1760
     base_lr: float = 2e-4
     weight_decay: float = 0.02
     batch_size: int = 16
