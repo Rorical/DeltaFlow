@@ -29,7 +29,7 @@ if os.environ.get("TPU_PROCESS_ADDRESSES") == "local":
 
 @dataclass
 class TrainConfig:
-    epochs: int = 20
+    epochs: int = 5
     embed_dim: int = 400
     depth: int = 12
     num_heads: int = 8
@@ -42,18 +42,18 @@ class TrainConfig:
     num_workers: Optional[int] = None
     prefetch_factor: Optional[int] = 2
     max_new_tokens: int = 100
-    prompt: str = "What is your dream? My dream is"
+    prompt: str = "On its day of"
     step_size: float = 1.0
     initial_velocity: str = "linear"
     dataset_name: str = "wikitext"
-    dataset_config: str = "wikitext-103-v1"
+    dataset_config: str = "wikitext-103-raw-v1"
     tokenizer_name: str = "gpt2"
     train_subset_size: Optional[int] = None
     val_subset_size: Optional[int] = 4096
     test_subset_size: Optional[int] = 4096
     seed: int = 42
     grad_clip_norm: float = 5.0
-    precision: str = "bf16-true"
+    precision: str = "32-true"
     log_every_n_steps: int = 1
     use_autocast: bool = True
     autocast_device_type: Optional[str] = None
@@ -230,6 +230,7 @@ class AutoregressiveLLMModule(pl.LightningModule):
         self.autocast_enabled = use_autocast
         self.autocast_device_type = autocast_device_type
         self.autocast_dtype = self._resolve_autocast_dtype(autocast_dtype)
+        self._val_example_batch: Optional[Dict[str, torch.Tensor]] = None
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -292,6 +293,12 @@ class AutoregressiveLLMModule(pl.LightningModule):
         targets = input_ids[:, 1:]
         padding = attention_mask[:, :-1]
 
+        if stage == "val" and self._val_example_batch is None:
+            trainer = getattr(self, "trainer", None)
+            is_global_zero = True if trainer is None else trainer.is_global_zero
+            if is_global_zero:
+                self._val_example_batch = {k: v.detach().clone() for k, v in batch.items()}
+
         with self._autocast_context():
             logits = self.model(inputs, padding_mask=padding)
             vocab_size = logits.size(-1)
@@ -326,20 +333,90 @@ class AutoregressiveLLMModule(pl.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         super().on_validation_epoch_end()
-        if self.sample_tokenizer is None:
-            return
         if self.trainer is not None and not self.trainer.is_global_zero:
+            self._val_example_batch = None
             return
-        try:
-            text = self.generate(
-                self.sample_tokenizer,
-                self.sample_prompt,
-                max_new_tokens=self.sample_max_new_tokens,
-            )
-        except ValueError as exc:
-            self.print(f"[generation skipped] {exc}")
+        if self.sample_tokenizer is not None:
+            try:
+                text = self.generate(
+                    self.sample_tokenizer,
+                    self.sample_prompt,
+                    max_new_tokens=self.sample_max_new_tokens,
+                )
+            except ValueError as exc:
+                self.print(f"[generation skipped] {exc}")
+            else:
+                self.print(f"=== Sampled Text (epoch {self.current_epoch}) ===\n{text}")
+        self._log_second_order_diagnostics()
+        self._val_example_batch = None
+
+    def _stack_param_norm(self, tensors: List[torch.Tensor]) -> float:
+        if not tensors:
+            return 0.0
+        norms = []
+        for tensor in tensors:
+            norms.append(tensor.detach().float().norm().cpu())
+        return float(torch.stack(norms).mean())
+
+    def _log_second_order_diagnostics(self) -> None:
+        """
+        After each epoch, check whether the second-order path is active.
+        Prints:
+          - Per-layer step sizes (should vary; all near 1e-3 means near-first-order).
+          - Per-layer norms for x, v, accel_attn, accel_ff on a held-out val batch.
+          - Mean parameter norms for velocity-specific weights.
+        TPU/XLA: small host syncs via .cpu() are acceptable here since this runs once per epoch.
+        """
+        if self._val_example_batch is None:
+            self.print("[second-order probe skipped] no cached validation batch.")
             return
-        self.print(f"=== Sampled Text (epoch {self.current_epoch}) ===\n{text}")
+
+        device = next(self.parameters()).device
+        padding_mask = self._val_example_batch["attention_mask"].to(device)
+        tokens = self._val_example_batch["input_ids"].to(device)
+        seq_len = tokens.size(1)
+        mask = self.model._build_attention_mask(padding_mask, seq_len, device)
+
+        with torch.no_grad():
+            embeddings = self.model.token_embedding(tokens)
+            _, _, layer_stats = self.model.backbone.forward_with_stats(embeddings, mask=mask)
+
+        steps = [stat["step"] for stat in layer_stats]
+        x_norms = [stat["x_norm"] for stat in layer_stats]
+        v_norms = [stat["v_norm"] for stat in layer_stats]
+        accel_attn_norms = [stat["accel_attn_norm"] for stat in layer_stats]
+        accel_ff_norms = [stat["accel_ff_norm"] for stat in layer_stats]
+        damping_vals = [stat.get("damping") for stat in layer_stats if "damping" in stat]
+
+        attn_layers = [layer.attention for layer in self.model.backbone.layers]
+        ff_layers = [layer.feed_forward for layer in self.model.backbone.layers]
+        fused_param_norms = {
+            "attn_q_proj": self._stack_param_norm([layer.q_proj.weight for layer in attn_layers]),
+            "attn_k_proj": self._stack_param_norm([layer.k_proj.weight for layer in attn_layers]),
+            "attn_v_proj": self._stack_param_norm([layer.v_proj.weight for layer in attn_layers]),
+            "ff_w1": self._stack_param_norm([layer.w1.weight for layer in ff_layers]),
+            "ff_w2": self._stack_param_norm([layer.w2.weight for layer in ff_layers]),
+        }
+
+        step_min, step_max = min(steps), max(steps)
+        v_over_x = float(torch.tensor(v_norms).mean() / max(torch.tensor(x_norms).mean(), 1e-6))
+        lines = [
+            "[second-order probe] step sizes:"
+            f" min={step_min:.4e}, max={step_max:.4e}, mean={float(torch.tensor(steps).mean()):.4e}",
+            f"[second-order probe] steps per layer: {', '.join(f'{s:.4e}' for s in steps)}",
+            "[second-order probe] norms (mean over batch/seq per layer): "
+            f"x={float(torch.tensor(x_norms).mean()):.4f}, "
+            f"v={float(torch.tensor(v_norms).mean()):.4f} (v/x={v_over_x:.4f}), "
+            f"accel_attn={float(torch.tensor(accel_attn_norms).mean()):.4f}, "
+            f"accel_ff={float(torch.tensor(accel_ff_norms).mean()):.4f}",
+            "[second-order probe] x_norm per layer: " + ", ".join(f"{n:.4f}" for n in x_norms),
+            "[second-order probe] v_norm per layer: " + ", ".join(f"{n:.4f}" for n in v_norms),
+            "[second-order probe] damping per layer: " + ", ".join(f"{d:.4f}" for d in damping_vals) if damping_vals else "[second-order probe] damping per layer: n/a",
+            "[second-order probe] fused param norms (mean over layers): "
+            + ", ".join(f"{k}={v:.4f}" for k, v in fused_param_norms.items()),
+        ]
+        for line in lines:
+            self.print(line)
 
     def generate(self, tokenizer: AutoTokenizer, prompt: str, max_new_tokens: int = 50) -> str:
         was_training = self.training

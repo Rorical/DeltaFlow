@@ -239,7 +239,7 @@ class FeedForward(nn.Module):
 
 class SecondOrderSelfAttention(nn.Module):
     """
-    Attention block that consumes position x and velocity v separately and predicts acceleration.
+    Attention block that consumes position x and velocity v, fusing them via concatenation to predict acceleration.
     """
 
     def __init__(
@@ -264,12 +264,10 @@ class SecondOrderSelfAttention(nn.Module):
             raise ValueError("rotary_dim must be even.")
 
         self.rotary = RotaryEmbedding(self.rotary_dim)
-        self.q_proj_x = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.q_proj_v = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.k_proj_x = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.k_proj_v = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj_x = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj_v = nn.Linear(embed_dim, embed_dim, bias=bias)
+        fused_dim = embed_dim * 2
+        self.q_proj = nn.Linear(fused_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(fused_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(fused_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
 
@@ -285,9 +283,11 @@ class SecondOrderSelfAttention(nn.Module):
         if x.shape != v.shape:
             raise ValueError("x and v must have identical shapes for second-order attention.")
         batch_size, seq_len, _ = x.shape
-        q = self.q_proj_x(x) + self.q_proj_v(v)
-        k = self.k_proj_x(x) + self.k_proj_v(v)
-        value = self.v_proj_x(x) + self.v_proj_v(v)
+        # Scale fused inputs to keep variance stable after concatenation.
+        fused = torch.cat([x, v], dim=-1) / math.sqrt(2.0)
+        q = self.q_proj(fused)
+        k = self.k_proj(fused)
+        value = self.v_proj(fused)
 
         q = self._shape(q, seq_len, batch_size)
         k = self._shape(k, seq_len, batch_size)
@@ -319,24 +319,24 @@ class SecondOrderSelfAttention(nn.Module):
 
 class SecondOrderFeedForward(nn.Module):
     """
-    Feed-forward network that consumes x and v independently and predicts acceleration.
+    Feed-forward network that consumes x and v via concatenation and predicts acceleration.
     """
 
     def __init__(self, embed_dim: int, hidden_dim: Optional[int] = None, bias: bool = True):
         super().__init__()
         hidden_dim = hidden_dim or embed_dim * 4
-        self.w1_x = nn.Linear(embed_dim, hidden_dim, bias=bias)
-        self.w1_v = nn.Linear(embed_dim, hidden_dim, bias=False)
-        self.w2_x = nn.Linear(embed_dim, hidden_dim, bias=bias)
-        self.w2_v = nn.Linear(embed_dim, hidden_dim, bias=False)
+        fused_dim = embed_dim * 2
+        self.w1 = nn.Linear(fused_dim, hidden_dim, bias=bias)
+        self.w2 = nn.Linear(fused_dim, hidden_dim, bias=bias)
         self.w3 = nn.Linear(hidden_dim, embed_dim, bias=bias)
 
     def forward(self, x: Tensor, v: Tensor) -> Tensor:
         if x.shape != v.shape:
             raise ValueError("x and v must have identical shapes for second-order feed-forward input.")
-        x_1 = self.w1_x(x) + self.w1_v(v)
-        x_2 = self.w2_x(x) + self.w2_v(v)
-        gated = F.silu(x_1) * x_2
+        fused = torch.cat([x, v], dim=-1) / math.sqrt(2.0)
+        fused_1 = self.w1(fused)
+        fused_2 = self.w2(fused)
+        gated = F.silu(fused_1) * fused_2
         return self.w3(gated)
 
 
@@ -357,10 +357,13 @@ class SecondOrderTransformerLayer(nn.Module):
         layer_norm_eps: float = 1e-5,
         bias: bool = True,
         step_size: float = 1.0,
+        damping_init: float = 0.1,
     ):
         super().__init__()
         if step_size <= 0:
             raise ValueError("step_size must be positive for stable second-order updates.")
+        if damping_init <= 0 or damping_init >= 1:
+            raise ValueError("damping_init must be in (0, 1) to define a valid damping factor.")
         self.attn_x_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         self.attn_v_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
         self.ffn_x_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
@@ -378,6 +381,8 @@ class SecondOrderTransformerLayer(nn.Module):
         self.log_step = nn.Parameter(torch.log(torch.tensor(float(step_size), dtype=torch.float32)))
         self._min_log_step = math.log(1e-3)
         self._max_log_step = math.log(2.0)
+        logit = math.log(damping_init) - math.log(1.0 - damping_init)
+        self.damping_logit = nn.Parameter(torch.tensor(float(logit), dtype=torch.float32))
 
     def _stable_step(self) -> Tensor:
         bounded_log_step = torch.clamp(self.log_step, min=self._min_log_step, max=self._max_log_step)
@@ -388,7 +393,8 @@ class SecondOrderTransformerLayer(nn.Module):
         x: Tensor,
         v: Tensor,
         mask: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor]:
+        return_stats: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, dict[str, float]]:
         """
         Args:
             x: Current position tensor (batch, seq_len, embed_dim)
@@ -397,21 +403,32 @@ class SecondOrderTransformerLayer(nn.Module):
             Tuple of updated (x, v) after a second-order residual step.
         """
         step = self._stable_step()
+        damping = torch.sigmoid(self.damping_logit)
 
         # First update: attention predicts acceleration.
         attn_x = self.attn_x_norm(x)
         attn_v = self.attn_v_norm(v)
         accel_attn = self.attn_dropout(self.attention(attn_x, attn_v, mask=mask))
-        v = v + step * accel_attn
+        v = (1 - damping) * v + step * accel_attn
         x = x + step * v
 
         # Second update: feed-forward predicts acceleration.
         ffn_x = self.ffn_x_norm(x)
         ffn_v = self.ffn_v_norm(v)
         accel_ff = self.ff_dropout(self.feed_forward(ffn_x, ffn_v))
-        v = v + step * accel_ff
+        v = (1 - damping) * v + step * accel_ff
         x = x + step * v
 
+        if return_stats:
+            stats = {
+                "step": float(step.detach().cpu()),
+                "accel_attn_norm": float(accel_attn.float().norm(dim=-1).mean().cpu()),
+                "accel_ff_norm": float(accel_ff.float().norm(dim=-1).mean().cpu()),
+                "x_norm": float(x.float().norm(dim=-1).mean().cpu()),
+                "v_norm": float(v.float().norm(dim=-1).mean().cpu()),
+                "damping": float(damping.detach().cpu()),
+            }
+            return x, v, stats
         return x, v
 
 
@@ -433,6 +450,7 @@ class SecondOrderTransformerStack(nn.Module):
         bias: bool = True,
         step_size: float = 1.0,
         initial_velocity: str = "linear",
+        damping_init: float = 0.1,
     ):
         super().__init__()
         if depth <= 0:
@@ -451,6 +469,7 @@ class SecondOrderTransformerStack(nn.Module):
                     layer_norm_eps=layer_norm_eps,
                     bias=bias,
                     step_size=step_size,
+                    damping_init=damping_init,
                 )
                 for _ in range(depth)
             ]
@@ -484,6 +503,25 @@ class SecondOrderTransformerStack(nn.Module):
             return x, v
         return x
 
+    def forward_with_stats(
+        self,
+        x: Tensor,
+        mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor, list[dict[str, float]]]:
+        """
+        Run the stack while collecting per-layer second-order stats.
+        """
+        if self.initial_velocity == "zero" or self.velocity_proj is None:
+            v = torch.zeros_like(x)
+        else:
+            v = self.velocity_proj(x)
+
+        layer_stats: list[dict[str, float]] = []
+        for layer in self.layers:
+            x, v, stats = layer(x, v, mask=mask, return_stats=True)
+            layer_stats.append(stats)
+        return x, v, layer_stats
+
 
 class LLM(nn.Module):
     """
@@ -505,6 +543,7 @@ class LLM(nn.Module):
         final_layer_norm: bool = True,
         step_size: float = 1.0,
         initial_velocity: str = "linear",
+        damping_init: float = 0.1,
     ):
         super().__init__()
         if vocab_size <= 0:
@@ -523,6 +562,7 @@ class LLM(nn.Module):
             bias=bias,
             step_size=step_size,
             initial_velocity=initial_velocity,
+            damping_init=damping_init,
         )
         self.final_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps) if final_layer_norm else None
         self._reset_parameters()
